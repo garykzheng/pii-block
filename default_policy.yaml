@@ -1,0 +1,6 @@
+entities:
+  PERSON:
+    operator: deterministic_faker
+  DEFAULT:
+    operator: replace
+    new_value: '<REDACTED>'

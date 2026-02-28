@@ -1,0 +1,5 @@
+servers:
+  test-filesystem:
+    target: npx -y @anthropic/mcp-server-filesystem /tmp
+    enabled: false
+    added_at: '2026-02-27T21:35:02.523847+00:00'

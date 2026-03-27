@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 .env
+policy.local.yaml
+mappings.json
+.DS_Store
+.mcp.json

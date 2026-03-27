@@ -20,6 +20,8 @@ class ServerEntry:
     target: str
     enabled: bool = True
     added_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    auth: str | None = None  # "oauth" or a bearer token string
+    headers: dict[str, str] | None = None  # custom headers (e.g. API keys)
 
 
 class ServerRegistry:
@@ -52,6 +54,8 @@ class ServerRegistry:
                 target=cfg["target"],
                 enabled=cfg.get("enabled", True),
                 added_at=cfg.get("added_at", datetime.now(timezone.utc).isoformat()),
+                auth=cfg.get("auth"),
+                headers=cfg.get("headers"),
             )
 
     def save(self) -> None:
@@ -60,11 +64,16 @@ class ServerRegistry:
             return
         data: dict[str, Any] = {"servers": {}}
         for name, entry in self._servers.items():
-            data["servers"][name] = {
+            d: dict[str, Any] = {
                 "target": entry.target,
                 "enabled": entry.enabled,
                 "added_at": entry.added_at,
             }
+            if entry.auth is not None:
+                d["auth"] = entry.auth
+            if entry.headers is not None:
+                d["headers"] = entry.headers
+            data["servers"][name] = d
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
@@ -95,6 +104,29 @@ class ServerRegistry:
         if name not in self._servers:
             raise KeyError(f"Server '{name}' not found")
         self._servers[name].enabled = False
+        self.save()
+
+    def set_auth(
+        self,
+        name: str,
+        auth: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        """Set auth and/or headers for a server."""
+        if name not in self._servers:
+            raise KeyError(f"Server '{name}' not found")
+        if auth is not None:
+            self._servers[name].auth = auth
+        if headers is not None:
+            self._servers[name].headers = headers
+        self.save()
+
+    def clear_auth(self, name: str) -> None:
+        """Remove auth config from a server."""
+        if name not in self._servers:
+            raise KeyError(f"Server '{name}' not found")
+        self._servers[name].auth = None
+        self._servers[name].headers = None
         self.save()
 
     def enabled_servers(self) -> dict[str, ServerEntry]:

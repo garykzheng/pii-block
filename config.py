@@ -1,16 +1,25 @@
 """Policy configuration loader for the MCP Privacy Proxy.
 
-Reads a YAML file that maps PII entity types to anonymization operators and
-optionally defines custom regex-based recognizers.
+Reads a YAML file that maps PII entity types to anonymization operators,
+optionally defines custom regex-based recognizers, and field-level rules
+for masking structured JSON responses.
 """
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from mapping_store import default_data_dir
+
+
+def default_policy_path() -> Path:
+    """Return the default path for the policy file."""
+    return default_data_dir() / "policy.yaml"
 
 
 @dataclass
@@ -32,10 +41,23 @@ class CustomRecognizer:
 
 
 @dataclass
+class FieldRule:
+    """A rule that maps a JSON field path pattern to a PII entity type.
+
+    The pattern uses glob syntax matched against dot-separated JSON paths.
+    Examples: "*.first_name", "data.*.email", "*.ssn"
+    """
+    pattern: str          # Glob pattern for JSON field paths
+    entity: str           # Entity type, e.g. "PERSON", "EMAIL_ADDRESS"
+
+
+@dataclass
 class PolicyConfig:
     """Full proxy policy configuration."""
     entities: dict[str, EntityPolicy] = field(default_factory=dict)
     custom_recognizers: list[CustomRecognizer] = field(default_factory=list)
+    field_rules: list[FieldRule] = field(default_factory=list)
+    allow_list: list[str] = field(default_factory=list)
 
     def get_entity_policy(self, entity_type: str) -> EntityPolicy:
         """Return the policy for a given entity type, falling back to DEFAULT."""
@@ -45,6 +67,13 @@ class PolicyConfig:
             "DEFAULT",
             EntityPolicy(operator="replace", new_value="<REDACTED>"),
         )
+
+    def match_field(self, field_path: str) -> str | None:
+        """Return the entity type for a field path, or None if no rule matches."""
+        for rule in self.field_rules:
+            if fnmatch.fnmatch(field_path, rule.pattern):
+                return rule.entity
+        return None
 
 
 def load_policy(path: str | Path) -> PolicyConfig:
@@ -71,7 +100,21 @@ def load_policy(path: str | Path) -> PolicyConfig:
             tweak=rec.get("tweak"),
         ))
 
-    return PolicyConfig(entities=entities, custom_recognizers=custom_recognizers)
+    field_rules: list[FieldRule] = []
+    for rule in raw.get("field_rules", []):
+        field_rules.append(FieldRule(
+            pattern=rule["pattern"],
+            entity=rule["entity"],
+        ))
+
+    allow_list: list[str] = raw.get("allow_list", [])
+
+    return PolicyConfig(
+        entities=entities,
+        custom_recognizers=custom_recognizers,
+        field_rules=field_rules,
+        allow_list=allow_list,
+    )
 
 
 def save_policy(policy: PolicyConfig, path: str | Path) -> None:
@@ -103,6 +146,18 @@ def save_policy(policy: PolicyConfig, path: str | Path) -> None:
                 entry["tweak"] = rec.tweak
             recs.append(entry)
         data["custom_recognizers"] = recs
+
+    if policy.field_rules:
+        rules: list[dict[str, str]] = []
+        for rule in policy.field_rules:
+            rules.append({
+                "pattern": rule.pattern,
+                "entity": rule.entity,
+            })
+        data["field_rules"] = rules
+
+    if policy.allow_list:
+        data["allow_list"] = policy.allow_list
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:

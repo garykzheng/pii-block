@@ -33,7 +33,7 @@ import tempfile
 from pathlib import Path
 
 from config import load_policy, save_policy, EntityPolicy
-from mapping_store import MappingStore
+from mapping_store import MappingStore, default_mapping_path
 from server_registry import ServerRegistry
 
 
@@ -44,7 +44,7 @@ def _resolve_paths() -> tuple[str, str, str]:
         str(Path(__file__).parent / "default_policy.yaml"),
     )
     servers_path = os.environ.get("SERVERS_PATH", "servers.yaml")
-    mapping_path = os.environ.get("MAPPING_STORE_PATH", "mappings.json")
+    mapping_path = os.environ.get("MAPPING_STORE_PATH", str(default_mapping_path()))
     return config_path, servers_path, mapping_path
 
 

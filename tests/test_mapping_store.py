@@ -91,15 +91,19 @@ class TestPersistence:
         assert store2.get_real_value("US_SSN", "987-65-4321") == "123-45-6789"
         assert store2.get_surrogate("PERSON", "John Smith") == "Jane Doe"
 
-    def test_persists_valid_json(self, tmp_path):
+    def test_persists_to_file(self, tmp_path):
         path = tmp_path / "mappings.json"
         store = MappingStore(path=path)
         store.store("US_SSN", "123-45-6789", "987-65-4321")
         store._save_sync()
 
-        data = json.loads(path.read_text())
-        assert "forward" in data
-        assert "US_SSN" in data["forward"]
+        # File should exist and be non-empty (may be encrypted or plaintext)
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+        # Verify data round-trips through a new store instance
+        store2 = MappingStore(path=path)
+        assert store2.get_surrogate("US_SSN", "123-45-6789") == "987-65-4321"
 
     def test_load_nonexistent_file(self, tmp_path):
         path = tmp_path / "nonexistent.json"

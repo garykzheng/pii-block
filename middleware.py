@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any, Sequence
 
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
@@ -27,6 +28,82 @@ from operators import (
 )
 
 logger = logging.getLogger("privacy_middleware")
+
+
+_BLOCK_TAGS = frozenset({
+    "br", "p", "div", "li", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5",
+    "h6", "blockquote", "pre", "hr", "table", "thead", "tbody", "ul", "ol",
+})
+
+
+def _strip_html(html: str) -> tuple[str, list[int]]:
+    """Strip HTML tags and return (plain_text, offset_map).
+
+    offset_map[i] gives the index in the original HTML string that corresponds
+    to plain_text[i]. This allows mapping Presidio detections on the plain text
+    back to their positions in the original HTML.
+
+    Block-level tags (br, p, div, etc.) insert a space so that text on either
+    side doesn't run together.
+    """
+    plain_chars: list[str] = []
+    offset_map: list[int] = []
+    i = 0
+    n = len(html)
+
+    while i < n:
+        if html[i] == "<":
+            # Skip to end of tag
+            end = html.find(">", i)
+            if end == -1:
+                break
+            # Check if this is a block-level tag that should insert whitespace
+            tag_content = html[i + 1:end].strip().lower()
+            # Remove leading / for closing tags
+            tag_name = tag_content.lstrip("/").split()[0].split("/")[0] if tag_content else ""
+            if tag_name in _BLOCK_TAGS and plain_chars and plain_chars[-1] != " ":
+                plain_chars.append(" ")
+                offset_map.append(i)
+            i = end + 1
+        elif html[i] == "&":
+            # Decode HTML entity
+            semi = html.find(";", i, i + 10)
+            if semi != -1:
+                entity = html[i:semi + 1]
+                if entity == "&#39;":
+                    plain_chars.append("'")
+                    offset_map.append(i)
+                elif entity == "&amp;":
+                    plain_chars.append("&")
+                    offset_map.append(i)
+                elif entity == "&lt;":
+                    plain_chars.append("<")
+                    offset_map.append(i)
+                elif entity == "&gt;":
+                    plain_chars.append(">")
+                    offset_map.append(i)
+                elif entity == "&quot;":
+                    plain_chars.append('"')
+                    offset_map.append(i)
+                elif entity == "&nbsp;":
+                    plain_chars.append(" ")
+                    offset_map.append(i)
+                else:
+                    # Unknown entity — keep as-is
+                    for j in range(i, semi + 1):
+                        plain_chars.append(html[j])
+                        offset_map.append(j)
+                i = semi + 1
+            else:
+                plain_chars.append(html[i])
+                offset_map.append(i)
+                i += 1
+        else:
+            plain_chars.append(html[i])
+            offset_map.append(i)
+            i += 1
+
+    return "".join(plain_chars), offset_map
 
 
 class PrivacyMiddleware(Middleware):
@@ -160,18 +237,28 @@ class PrivacyMiddleware(Middleware):
         return new_args
 
     def _demap_string(self, text: str) -> str:
-        """Replace any known surrogates found in a string with their real values."""
+        """Replace any known surrogates found in a string with their real values.
+
+        Uses case-insensitive matching so that "kari robinson", "KARI ROBINSON",
+        and "Kari Robinson" all resolve to the original real value.
+        """
         surrogates = self.mapping_store.all_surrogates()
         if not surrogates:
             return text
 
         # Sort by length descending to match longer surrogates first
         for surrogate in sorted(surrogates, key=len, reverse=True):
-            if surrogate in text:
+            # Case-insensitive search
+            idx = text.lower().find(surrogate.lower())
+            while idx != -1:
                 result = self.mapping_store.has_surrogate_anywhere(surrogate)
                 if result is not None:
                     _entity_type, real_value = result
-                    text = text.replace(surrogate, real_value)
+                    text = text[:idx] + real_value + text[idx + len(surrogate):]
+                    # Continue searching after the replacement
+                    idx = text.lower().find(surrogate.lower(), idx + len(real_value))
+                else:
+                    break
         return text
 
     # ── PII masking (inbound) ─────────────────────────────────────────────
@@ -179,18 +266,23 @@ class PrivacyMiddleware(Middleware):
     def _mask_tool_result(self, result: Any) -> Any:
         """Mask PII in a tool call result.
 
-        Tool results are typically a list of content items. Each text content
-        item gets scanned and anonymized.
+        Tool results are typically CallToolResult objects with a .content list,
+        or plain strings/lists.
         """
         if result is None:
             return result
 
-        # FastMCP tool results can be strings, lists of content objects, etc.
+        # Handle CallToolResult (the actual type returned by FastMCP proxies)
+        if hasattr(result, "content") and isinstance(result.content, list):
+            masked = [self._mask_content_item(item) for item in result.content]
+            if hasattr(result, "model_copy"):
+                return result.model_copy(update={"content": masked})
+            return result
+
         if isinstance(result, str):
             return self._mask_text(result)
         if isinstance(result, list):
             return [self._mask_content_item(item) for item in result]
-        # If it's some other type, try to handle it gracefully
         return result
 
     def _mask_tool_result_with_stats(
@@ -200,6 +292,15 @@ class PrivacyMiddleware(Middleware):
         if result is None:
             return result, [], 0
 
+        # Handle CallToolResult (the actual type returned by FastMCP proxies)
+        if hasattr(result, "content") and isinstance(result.content, list):
+            masked_content, types, count = self._mask_content_list_with_stats(
+                result.content
+            )
+            if count > 0 and hasattr(result, "model_copy"):
+                result = result.model_copy(update={"content": masked_content})
+            return result, types, count
+
         all_types: list[str] = []
         total_count = 0
 
@@ -207,39 +308,52 @@ class PrivacyMiddleware(Middleware):
             masked, types, count = self._mask_text_with_stats(result)
             return masked, types, count
         if isinstance(result, list):
-            masked_items = []
-            for item in result:
-                if isinstance(item, str):
-                    masked, types, count = self._mask_text_with_stats(item)
-                    masked_items.append(masked)
-                    all_types.extend(types)
-                    total_count += count
-                elif hasattr(item, "text") and isinstance(item.text, str):
-                    masked, types, count = self._mask_text_with_stats(item.text)
-                    if masked != item.text:
-                        if hasattr(item, "model_copy"):
-                            item = item.model_copy(update={"text": masked})
-                        elif hasattr(item, "_replace"):
-                            item = item._replace(text=masked)
-                        else:
-                            try:
-                                item.text = masked
-                            except (AttributeError, TypeError):
-                                pass
-                    masked_items.append(item)
-                    all_types.extend(types)
-                    total_count += count
-                else:
-                    masked_items.append(item)
-            # Deduplicate entity types while preserving order
-            seen = set()
-            unique_types = []
-            for t in all_types:
-                if t not in seen:
-                    seen.add(t)
-                    unique_types.append(t)
-            return masked_items, unique_types, total_count
+            masked_items, all_types, total_count = self._mask_content_list_with_stats(
+                result
+            )
+            return masked_items, all_types, total_count
         return result, [], 0
+
+    def _mask_content_list_with_stats(
+        self, items: list[Any]
+    ) -> tuple[list[Any], list[str], int]:
+        """Mask PII in a list of content items, returning (masked_items, entity_types, count)."""
+        all_types: list[str] = []
+        total_count = 0
+        masked_items = []
+
+        for item in items:
+            if isinstance(item, str):
+                masked, types, count = self._mask_text_with_stats(item)
+                masked_items.append(masked)
+                all_types.extend(types)
+                total_count += count
+            elif hasattr(item, "text") and isinstance(item.text, str):
+                masked, types, count = self._mask_text_with_stats(item.text)
+                if masked != item.text:
+                    if hasattr(item, "model_copy"):
+                        item = item.model_copy(update={"text": masked})
+                    elif hasattr(item, "_replace"):
+                        item = item._replace(text=masked)
+                    else:
+                        try:
+                            item.text = masked
+                        except (AttributeError, TypeError):
+                            pass
+                masked_items.append(item)
+                all_types.extend(types)
+                total_count += count
+            else:
+                masked_items.append(item)
+
+        # Deduplicate entity types while preserving order
+        seen = set()
+        unique_types = []
+        for t in all_types:
+            if t not in seen:
+                seen.add(t)
+                unique_types.append(t)
+        return masked_items, unique_types, total_count
 
     @staticmethod
     def _count_demap_changes(
@@ -264,6 +378,11 @@ class PrivacyMiddleware(Middleware):
     def _mask_resource_result(self, result: Any) -> Any:
         """Mask PII in a resource read result."""
         if result is None:
+            return result
+        if hasattr(result, "contents") and isinstance(result.contents, list):
+            masked = [self._mask_content_item(item) for item in result.contents]
+            if hasattr(result, "model_copy"):
+                return result.model_copy(update={"contents": masked})
             return result
         if isinstance(result, str):
             return self._mask_text(result)
@@ -298,22 +417,171 @@ class PrivacyMiddleware(Middleware):
         masked, _types, _count = self._mask_text_with_stats(text)
         return masked
 
+    def _apply_field_rules(self, text: str) -> tuple[str, int]:
+        """Apply field-level PII rules to JSON text.
+
+        Parses the text as JSON, walks all fields, and masks values whose
+        field path matches a rule in the policy. Handles PERSON fields
+        specially: if adjacent first_name/last_name fields exist, combines
+        them for consistent surrogate generation.
+
+        Returns (masked_text, replacement_count). If the text is not valid
+        JSON, returns it unchanged.
+        """
+        if not self.policy.field_rules:
+            return text, 0
+
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return text, 0
+
+        count = 0
+
+        def walk(obj: Any, path: str) -> Any:
+            nonlocal count
+            if isinstance(obj, dict):
+                # Look for first_name + last_name pairs to combine
+                obj = self._combine_name_fields(obj, path)
+
+                new_obj = {}
+                for key, value in obj.items():
+                    field_path = f"{path}.{key}" if path else key
+                    entity = self.policy.match_field(field_path)
+                    if entity and isinstance(value, str) and value.strip():
+                        masked = self._mask_field_value(value, entity)
+                        if masked != value:
+                            count += 1
+                        new_obj[key] = masked
+                    else:
+                        new_obj[key] = walk(value, field_path)
+                return new_obj
+            elif isinstance(obj, list):
+                return [walk(item, path) for item in obj]
+            return obj
+
+        masked_data = walk(data, "")
+        return json.dumps(masked_data, ensure_ascii=False), count
+
+    def _combine_name_fields(self, obj: dict, path: str) -> dict:
+        """If a dict has first_name + last_name, ensure consistent mapping.
+
+        Generates the full-name surrogate first (which creates sub-tokens),
+        so individual field masking picks up the aligned sub-tokens.
+        """
+        first = obj.get("first_name", "")
+        last = obj.get("last_name", "")
+        if first and last and isinstance(first, str) and isinstance(last, str):
+            full_name = f"{first} {last}"
+            # Check if we already have a mapping
+            existing = self.mapping_store.get_surrogate("PERSON", full_name)
+            if existing is None:
+                # Generate one — this creates sub-token mappings too
+                self._mask_field_value(full_name, "PERSON")
+        return obj
+
+    def _mask_field_value(self, value: str, entity_type: str) -> str:
+        """Mask a single field value using the configured operator for its entity type."""
+        policy = self.policy.get_entity_policy(entity_type)
+        op_config = self._policy_to_operator_config(policy, entity_type)
+        try:
+            result = self.anonymizer.anonymize(
+                text=value,
+                analyzer_results=[RecognizerResult(
+                    entity_type=entity_type,
+                    start=0,
+                    end=len(value),
+                    score=1.0,
+                )],
+                operators={entity_type: op_config},
+            )
+            return result.text
+        except Exception:
+            return value
+
+    def _prescan_known_values(self, text: str) -> tuple[str, int]:
+        """Replace any known real PII values with their surrogates.
+
+        Scans the text for all real values in the mapping store (longest-first,
+        case-insensitive) and replaces them. This catches:
+        - Structured JSON fields (first_name, last_name, email, etc.)
+        - Repeat appearances of previously-detected PII
+        - Values that Presidio might miss due to lack of surrounding context
+
+        Returns (masked_text, replacement_count).
+        """
+        count = 0
+        forward = self.mapping_store.dump()
+        if not forward:
+            return text, 0
+
+        # Collect all (real_value, surrogate) pairs across entity types,
+        # excluding very short values (< 4 chars) to avoid false matches
+        # on common words embedded in longer text.
+        # Also skip any values on the policy allow list.
+        allow_set = {v.lower() for v in self.policy.allow_list}
+        pairs: list[tuple[str, str]] = []
+        for _etype, mappings in forward.items():
+            for real_val, surrogate in mappings.items():
+                if len(real_val) >= 4 and real_val.lower() not in allow_set:
+                    pairs.append((real_val, surrogate))
+
+        # Sort by length descending — replace longer values first
+        pairs.sort(key=lambda p: len(p[0]), reverse=True)
+
+        for real_val, surrogate in pairs:
+            # Case-insensitive search and replace
+            idx = text.lower().find(real_val.lower())
+            while idx != -1:
+                # Don't replace inside already-substituted surrogates or URLs
+                text = text[:idx] + surrogate + text[idx + len(real_val):]
+                count += 1
+                idx = text.lower().find(real_val.lower(), idx + len(surrogate))
+
+        return text, count
+
     def _mask_text_with_stats(self, text: str) -> tuple[str, list[str], int]:
-        """Run Presidio analysis + anonymization, returning (masked, entity_types, count)."""
+        """Run Presidio analysis + anonymization, returning (masked, entity_types, count).
+
+        Two-phase approach:
+        1. Pre-scan: replace any known real values from the mapping store
+           (catches structured fields like first_name/last_name and repeat
+           appearances of previously-detected PII)
+        2. Presidio: detect and mask any *new* PII not yet in the store
+        """
         if not text or not text.strip():
             return text, [], 0
 
         # First check for partially masked values and reconcile them
         text = self._reconcile_partial_masks(text)
 
-        # Build allow list from known surrogates so Presidio doesn't
-        # re-detect surrogate values as new PII
-        allow_list = list(self.mapping_store.all_surrogates()) or None
+        # Phase 0: Apply field-level rules to JSON responses.
+        # This handles structured fields like first_name/last_name
+        # that Presidio can't detect without context.
+        text, field_count = self._apply_field_rules(text)
 
-        # Detect PII
+        # Phase 1: Pre-scan for known real values already in the mapping store.
+        # This catches PII in structured JSON fields and repeat appearances
+        # that Presidio might miss due to lack of context.
+        text, prescan_count = self._prescan_known_values(text)
+
+        # Build allow list: policy allow_list terms + known surrogates
+        # so Presidio skips both user-protected terms and already-masked values
+        allow_list = list(self.policy.allow_list) + list(self.mapping_store.all_surrogates())
+        allow_list = allow_list or None
+
+        # If the text looks like HTML, extract plain text for analysis
+        is_html = bool(re.search(r"<[a-zA-Z][^>]*>", text))
+        if is_html:
+            plain_text, offset_map = _strip_html(text)
+        else:
+            plain_text = text
+            offset_map = None
+
+        # Phase 2: Detect *new* PII on plain text
         try:
             analyzer_results = self.analyzer.analyze(
-                text=text,
+                text=plain_text,
                 language="en",
                 entities=self._entity_types if self._entity_types else None,
                 score_threshold=0.4,
@@ -321,18 +589,30 @@ class PrivacyMiddleware(Middleware):
             )
         except Exception as e:
             logger.warning("Presidio analysis failed: %s", e)
+            prior_count = field_count + prescan_count
+            if prior_count > 0:
+                return text, [], prior_count
             return text, [], 0
 
+        # Filter out low-quality detections
+        analyzer_results = self._filter_results(analyzer_results, plain_text)
+
         if not analyzer_results:
+            prior_count = field_count + prescan_count
+            if prior_count > 0:
+                return text, [], prior_count
             return text, [], 0
 
         entity_types = list({r.entity_type for r in analyzer_results})
-        count = len(analyzer_results)
+        count = len(analyzer_results) + field_count + prescan_count
 
-        # Build operator configs for each entity type found
+        if is_html and offset_map is not None:
+            # Apply masks directly to the original HTML using offset mapping
+            masked = self._apply_masks_to_html(text, plain_text, analyzer_results, offset_map)
+            return masked, entity_types, count
+
+        # Non-HTML: use Presidio's anonymizer directly
         operators = self._build_operator_configs(analyzer_results)
-
-        # Anonymize
         try:
             result = self.anonymizer.anonymize(
                 text=text,
@@ -343,6 +623,94 @@ class PrivacyMiddleware(Middleware):
         except Exception as e:
             logger.warning("Presidio anonymization failed: %s", e)
             return text, [], 0
+
+    @staticmethod
+    def _filter_results(
+        results: list[RecognizerResult], text: str
+    ) -> list[RecognizerResult]:
+        """Filter out low-quality Presidio detections.
+
+        Removes:
+        - PERSON entities that are too short (< 3 chars), single initials
+        - PERSON entities that span newlines (likely multi-line blobs)
+        - PERSON entities that look like URLs
+        - PERSON entities that are common short words (1-2 chars)
+        """
+        filtered = []
+        for r in results:
+            value = text[r.start:r.end]
+
+            if r.entity_type == "PERSON":
+                # Skip very short values (initials, single chars)
+                stripped = value.strip().rstrip(".")
+                if len(stripped) < 3:
+                    continue
+                # Skip values spanning newlines (multi-line blobs)
+                if "\n" in value:
+                    continue
+                # Skip values that look like URLs or contain URL patterns
+                if "://" in value or "usepylon.com" in value or "assets." in value:
+                    continue
+                # Skip values containing @ (emails misdetected as names)
+                if "@" in value:
+                    continue
+
+            filtered.append(r)
+        return filtered
+
+    def _apply_masks_to_html(
+        self,
+        html: str,
+        plain_text: str,
+        analyzer_results: list[RecognizerResult],
+        offset_map: list[int],
+    ) -> str:
+        """Apply PII masks to original HTML using plain-text detection offsets.
+
+        For each detected PII span in the plain text, finds the corresponding
+        positions in the original HTML and replaces the real value with its
+        surrogate.
+        """
+        # Sort results by start position descending so replacements don't
+        # shift offsets of earlier results
+        sorted_results = sorted(analyzer_results, key=lambda r: r.start, reverse=True)
+
+        for result in sorted_results:
+            real_value = plain_text[result.start:result.end]
+            if not real_value.strip():
+                continue
+
+            # Generate the surrogate for this entity
+            policy = self.policy.get_entity_policy(result.entity_type)
+            op_config = self._policy_to_operator_config(policy, result.entity_type)
+            try:
+                surrogate = self.anonymizer.anonymize(
+                    text=real_value,
+                    analyzer_results=[RecognizerResult(
+                        entity_type=result.entity_type,
+                        start=0,
+                        end=len(real_value),
+                        score=result.score,
+                    )],
+                    operators={result.entity_type: op_config},
+                ).text
+            except Exception:
+                continue
+
+            # Map plain-text offsets back to HTML offsets
+            html_start = offset_map[result.start]
+            html_end = offset_map[result.end - 1] + 1
+
+            # Verify the mapped region contains the expected text (not tags)
+            html_fragment = html[html_start:html_end]
+            # Strip any tags from the fragment to get the text portion
+            fragment_text = re.sub(r"<[^>]+>", "", html_fragment)
+            if fragment_text.strip() and real_value in fragment_text:
+                # Replace the real value in the HTML fragment, preserving tags
+                new_fragment = html_fragment.replace(real_value, surrogate, 1)
+                html = html[:html_start] + new_fragment + html[html_end:]
+
+        return html
 
     def _build_operator_configs(
         self, analyzer_results: list[RecognizerResult]

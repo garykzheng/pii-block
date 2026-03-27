@@ -1,6 +1,42 @@
 entities:
   PERSON:
     operator: deterministic_faker
+  EMAIL_ADDRESS:
+    operator: deterministic_faker
+  PHONE_NUMBER:
+    operator: fpe
+  US_SSN:
+    operator: fpe
+  CREDIT_CARD:
+    operator: fpe
+  LOCATION:
+    operator: deterministic_faker
+  ADDRESS:
+    operator: deterministic_faker
+  ORGANIZATION:
+    operator: deterministic_faker
   DEFAULT:
     operator: replace
     new_value: '<REDACTED>'
+
+field_rules:
+  - pattern: "*.first_name"
+    entity: PERSON
+  - pattern: "*.last_name"
+    entity: PERSON
+  - pattern: "*.full_name"
+    entity: PERSON
+  - pattern: "*.name"
+    entity: PERSON
+  - pattern: "*.email"
+    entity: EMAIL_ADDRESS
+  - pattern: "*.email_address"
+    entity: EMAIL_ADDRESS
+  - pattern: "*.phone"
+    entity: PHONE_NUMBER
+  - pattern: "*.phone_number"
+    entity: PHONE_NUMBER
+  - pattern: "*.ssn"
+    entity: US_SSN
+  - pattern: "*.social_security_number"
+    entity: US_SSN

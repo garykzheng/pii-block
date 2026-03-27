@@ -11,6 +11,8 @@ dependencies = [
     "faker>=24.0,<26",
     "spacy>=3.7",
     "pyyaml>=6.0",
+    "keyring>=25.0",
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

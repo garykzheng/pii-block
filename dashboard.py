@@ -94,11 +94,15 @@ def create_dashboard_routes(
     audit_log: AuditLog,
     config_path: str,
     middleware: object | None = None,
+    rebuild_proxy: object | None = None,
 ) -> list[Route]:
     """Create all dashboard routes with shared state.
 
     The middleware parameter, if provided, should be the PrivacyMiddleware instance
     so we can call reload_policy() on hot-reload.
+
+    The rebuild_proxy parameter, if provided, should be a callable that rebuilds
+    the MCP proxy after auth/server changes.
     """
 
     # ── Dashboard home ────────────────────────────────────────────────
@@ -145,10 +149,22 @@ def create_dashboard_routes(
         for name, entry in all_servers.items():
             badge = '<span class="badge badge-on">ON</span>' if entry.enabled else '<span class="badge badge-off">OFF</span>'
             toggle_label = "Disable" if entry.enabled else "Enable"
+
+            # Auth status badge
+            if entry.auth == "oauth":
+                auth_badge = '<span class="badge badge-type">OAuth</span>'
+            elif entry.auth:
+                auth_badge = '<span class="badge badge-on">Bearer</span>'
+            elif entry.headers:
+                auth_badge = '<span class="badge badge-type">Headers</span>'
+            else:
+                auth_badge = '<span class="badge badge-off">None</span>'
+
             rows += f"""<tr>
               <td><strong>{name}</strong></td>
               <td class="mono">{entry.target}</td>
               <td>{badge}</td>
+              <td>{auth_badge}</td>
               <td class="mono">{entry.added_at[:10]}</td>
               <td>
                 <form method="post" action="/servers/{name}/toggle" style="display:inline">
@@ -156,6 +172,12 @@ def create_dashboard_routes(
                 </form>
                 <form method="post" action="/servers/{name}/delete" style="display:inline; margin-left:5px">
                   <button class="btn-sm btn-danger">Remove</button>
+                </form>
+                <form method="post" action="/servers/{name}/auth/oauth" style="display:inline; margin-left:5px">
+                  <button class="btn-sm">Authenticate</button>
+                </form>
+                <form method="post" action="/servers/{name}/auth/clear" style="display:inline; margin-left:5px">
+                  <button class="btn-sm btn-danger">Clear Auth</button>
                 </form>
               </td>
             </tr>"""
@@ -170,14 +192,28 @@ def create_dashboard_routes(
             <div class="form-row">
               <div class="field"><label>Name</label><input name="name" placeholder="my-server" required></div>
               <div class="field"><label>Target (URL or command)</label><input name="target" placeholder="http://localhost:3001/mcp" required></div>
+              <div class="field"><label>Auth (optional)</label>
+                <select name="auth" style="padding:8px 12px;border:1px solid #ddd;border-radius:5px;width:100%">
+                  <option value="">None</option>
+                  <option value="oauth">OAuth</option>
+                </select>
+              </div>
               <div class="field" style="flex:0"><label>&nbsp;</label><button type="submit">Add</button></div>
+            </div>
+          </form>
+          <h2 style="margin-top:20px">Set Bearer Token</h2>
+          <form method="post" action="/servers/auth/token">
+            <div class="form-row">
+              <div class="field"><label>Server name</label><input name="name" placeholder="my-server" required></div>
+              <div class="field"><label>Bearer token</label><input name="token" type="password" placeholder="sk-..." required></div>
+              <div class="field" style="flex:0"><label>&nbsp;</label><button type="submit">Set Token</button></div>
             </div>
           </form>
         </div>
 
         <div class="card">
           <h2>Registered Servers</h2>
-          {'<table><tr><th>Name</th><th>Target</th><th>Status</th><th>Added</th><th>Actions</th></tr>' +
+          {'<table><tr><th>Name</th><th>Target</th><th>Status</th><th>Auth</th><th>Added</th><th>Actions</th></tr>' +
            rows + '</table>' if rows else '<p class="empty">No servers registered</p>'}
         </div>
         """
@@ -187,9 +223,12 @@ def create_dashboard_routes(
         form = await request.form()
         name = str(form.get("name", "")).strip()
         target = str(form.get("target", "")).strip()
+        auth = str(form.get("auth", "")).strip() or None
         if name and target:
             try:
                 registry.add(name, target)
+                if auth:
+                    registry.set_auth(name, auth=auth)
             except ValueError:
                 pass  # Already exists
         return RedirectResponse("/servers", status_code=303)
@@ -211,6 +250,85 @@ def create_dashboard_routes(
         except KeyError:
             pass
         return RedirectResponse("/servers", status_code=303)
+
+    # ── Auth management ─────────────────────────────────────────────
+
+    async def servers_auth_oauth(request: Request) -> RedirectResponse:
+        """Set OAuth auth on a server via form POST."""
+        name = request.path_params["name"]
+        if registry.get(name):
+            registry.set_auth(name, auth="oauth")
+            if rebuild_proxy and callable(rebuild_proxy):
+                rebuild_proxy()
+        return RedirectResponse("/servers", status_code=303)
+
+    async def servers_auth_clear(request: Request) -> RedirectResponse:
+        """Clear auth config from a server via form POST."""
+        name = request.path_params["name"]
+        if registry.get(name):
+            registry.clear_auth(name)
+            if rebuild_proxy and callable(rebuild_proxy):
+                rebuild_proxy()
+        return RedirectResponse("/servers", status_code=303)
+
+    async def servers_auth_set_token(request: Request) -> RedirectResponse:
+        """Set a bearer token on a server via form POST."""
+        form = await request.form()
+        name = str(form.get("name", "")).strip()
+        token = str(form.get("token", "")).strip()
+        if name and token and registry.get(name):
+            registry.set_auth(name, auth=token)
+            if rebuild_proxy and callable(rebuild_proxy):
+                rebuild_proxy()
+        return RedirectResponse("/servers", status_code=303)
+
+    # ── Auth JSON API ──────────────────────────────────────────────
+
+    async def api_server_set_auth(request: Request) -> JSONResponse:
+        """Set auth for a server: {"auth": "oauth"} or {"auth": "<token>"} or {"headers": {...}}."""
+        name = request.path_params["name"]
+        entry = registry.get(name)
+        if not entry:
+            return JSONResponse({"error": f"Server '{name}' not found"}, status_code=404)
+        body = await request.json()
+        auth = body.get("auth")
+        headers = body.get("headers")
+        if auth is None and headers is None:
+            return JSONResponse({"error": "Provide 'auth' and/or 'headers'"}, status_code=400)
+        registry.set_auth(name, auth=auth, headers=headers)
+        if rebuild_proxy and callable(rebuild_proxy):
+            rebuild_proxy()
+        return JSONResponse({"ok": True})
+
+    async def api_server_clear_auth(request: Request) -> JSONResponse:
+        """Remove auth config from a server."""
+        name = request.path_params["name"]
+        entry = registry.get(name)
+        if not entry:
+            return JSONResponse({"error": f"Server '{name}' not found"}, status_code=404)
+        registry.clear_auth(name)
+        if rebuild_proxy and callable(rebuild_proxy):
+            rebuild_proxy()
+        return JSONResponse({"ok": True})
+
+    async def api_server_auth_status(request: Request) -> JSONResponse:
+        """Check auth status for a server."""
+        name = request.path_params["name"]
+        entry = registry.get(name)
+        if not entry:
+            return JSONResponse({"error": f"Server '{name}' not found"}, status_code=404)
+        if entry.auth == "oauth":
+            auth_type = "oauth"
+        elif entry.auth:
+            auth_type = "bearer"
+        elif entry.headers:
+            auth_type = "headers"
+        else:
+            auth_type = None
+        return JSONResponse({
+            "has_auth": entry.auth is not None or entry.headers is not None,
+            "auth_type": auth_type,
+        })
 
     # ── Audit log ─────────────────────────────────────────────────────
 
@@ -307,10 +425,24 @@ def create_dashboard_routes(
         return JSONResponse(audit_log.stats())
 
     async def api_servers(request: Request) -> JSONResponse:
-        return JSONResponse({
-            name: {"target": e.target, "enabled": e.enabled, "added_at": e.added_at}
-            for name, e in registry.all_servers().items()
-        })
+        result = {}
+        for name, e in registry.all_servers().items():
+            if e.auth == "oauth":
+                auth_type = "oauth"
+            elif e.auth:
+                auth_type = "bearer"
+            elif e.headers:
+                auth_type = "headers"
+            else:
+                auth_type = None
+            result[name] = {
+                "target": e.target,
+                "enabled": e.enabled,
+                "added_at": e.added_at,
+                "auth_type": auth_type,
+                "has_auth": e.auth is not None or e.headers is not None,
+            }
+        return JSONResponse(result)
 
     async def api_audit(request: Request) -> JSONResponse:
         return JSONResponse(audit_log.to_json())
@@ -343,6 +475,22 @@ def create_dashboard_routes(
             })
         return JSONResponse({"results": results})
 
+    async def api_audit_ingest(request: Request) -> JSONResponse:
+        """Receive an audit event from a remote proxy instance."""
+        from audit import AuditEvent
+        body = await request.json()
+        event = AuditEvent(
+            timestamp=body.get("timestamp", ""),
+            server=body.get("server", ""),
+            tool_name=body.get("tool_name", ""),
+            direction=body.get("direction", ""),
+            entity_types=body.get("entity_types", []),
+            masked_count=body.get("masked_count", 0),
+            demapped_count=body.get("demapped_count", 0),
+        )
+        audit_log.record(event)
+        return JSONResponse({"ok": True})
+
     async def api_mappings_lookup(request: Request) -> JSONResponse:
         surrogate = request.query_params.get("surrogate", "")
         if not surrogate:
@@ -365,12 +513,19 @@ def create_dashboard_routes(
         Route("/servers", servers_add, methods=["POST"]),
         Route("/servers/{name}/toggle", servers_toggle, methods=["POST"]),
         Route("/servers/{name}/delete", servers_delete, methods=["POST"]),
+        Route("/servers/{name}/auth/oauth", servers_auth_oauth, methods=["POST"]),
+        Route("/servers/{name}/auth/clear", servers_auth_clear, methods=["POST"]),
+        Route("/servers/auth/token", servers_auth_set_token, methods=["POST"]),
         Route("/audit", audit_page),
         Route("/policy", policy_page, methods=["GET"]),
         Route("/policy", policy_save, methods=["POST"]),
         Route("/api/stats", api_stats),
         Route("/api/servers", api_servers),
+        Route("/api/servers/{name}/auth", api_server_set_auth, methods=["POST"]),
+        Route("/api/servers/{name}/auth", api_server_clear_auth, methods=["DELETE"]),
+        Route("/api/servers/{name}/auth/status", api_server_auth_status),
         Route("/api/audit", api_audit),
+        Route("/api/audit/ingest", api_audit_ingest, methods=["POST"]),
         Route("/api/mappings", api_mappings),
         Route("/api/demask", api_demask, methods=["POST"]),
         Route("/api/demask/batch", api_demask_batch, methods=["POST"]),

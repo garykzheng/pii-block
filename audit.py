@@ -1,15 +1,23 @@
 """Audit log for PII transformation events.
 
-Session-scoped in-memory ring buffer that records what PII was detected,
-masked, and de-mapped during tool calls.
+AuditLog: in-memory ring buffer used by the dashboard server.
+RemoteAuditLog: fire-and-forget HTTP client used by stdio proxy instances
+    to push events to the dashboard. Silently drops events if the dashboard
+    isn't running.
 """
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+logger = logging.getLogger("audit")
 
 
 @dataclass
@@ -22,6 +30,17 @@ class AuditEvent:
     entity_types: list[str] = field(default_factory=list)
     masked_count: int = 0
     demapped_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "server": self.server,
+            "tool_name": self.tool_name,
+            "direction": self.direction,
+            "entity_types": self.entity_types,
+            "masked_count": self.masked_count,
+            "demapped_count": self.demapped_count,
+        }
 
 
 class AuditLog:
@@ -69,18 +88,31 @@ class AuditLog:
 
     def to_json(self) -> list[dict[str, Any]]:
         """Serialize all events as a list of dicts."""
-        return [
-            {
-                "timestamp": e.timestamp,
-                "server": e.server,
-                "tool_name": e.tool_name,
-                "direction": e.direction,
-                "entity_types": e.entity_types,
-                "masked_count": e.masked_count,
-                "demapped_count": e.demapped_count,
-            }
-            for e in self._events
-        ]
+        return [e.to_dict() for e in self._events]
 
     def __len__(self) -> int:
         return len(self._events)
+
+
+class RemoteAuditLog:
+    """Fire-and-forget HTTP client that pushes audit events to the dashboard.
+
+    If the dashboard isn't running, events are silently dropped.
+    Sends are done in background threads to avoid blocking tool calls.
+    """
+
+    def __init__(self, dashboard_url: str = "http://127.0.0.1:8080") -> None:
+        self._url = f"{dashboard_url.rstrip('/')}/api/audit/ingest"
+
+    def record(self, event: AuditEvent) -> None:
+        """Post an event to the dashboard in a background thread."""
+        threading.Thread(target=self._send, args=(event,), daemon=True).start()
+
+    def _send(self, event: AuditEvent) -> None:
+        import json
+        body = json.dumps(event.to_dict()).encode()
+        req = Request(self._url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            urlopen(req, timeout=1)
+        except (URLError, OSError):
+            pass

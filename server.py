@@ -25,7 +25,7 @@ from audit import AuditLog
 from config import load_policy
 from core import build_proxy
 from dashboard import create_dashboard_routes
-from mapping_store import MappingStore
+from mapping_store import MappingStore, default_mapping_path
 from middleware import PrivacyMiddleware
 from server_registry import ServerRegistry
 
@@ -36,7 +36,7 @@ def main() -> None:
         "FPE_KEY",
         "EF4359D8D580AA4F7F036D6F04FC6A94",
     )
-    mapping_path = os.environ.get("MAPPING_STORE_PATH", "mappings.json")
+    mapping_path = os.environ.get("MAPPING_STORE_PATH", str(default_mapping_path()))
     config_path = os.environ.get(
         "CONFIG_PATH",
         str(Path(__file__).parent / "default_policy.yaml"),
@@ -75,6 +75,27 @@ def main() -> None:
             break
 
     # ── Compose Starlette app ─────────────────────────────────────────
+    app = Starlette(routes=[])
+
+    def rebuild_proxy_fn() -> None:
+        """Rebuild the MCP proxy after auth/server changes and remount."""
+        nonlocal proxy, mw_instance
+        proxy = build_proxy(
+            registry=registry,
+            policy=policy,
+            mapping_store=mapping_store,
+            fpe_key=fpe_key,
+            audit_log=audit_log,
+        )
+        for mw in proxy.middleware:
+            if isinstance(mw, PrivacyMiddleware):
+                mw_instance = mw
+                break
+        mcp_app = proxy.http_app(path="/mcp")
+        # Replace the /mcp mount
+        app.routes = [r for r in app.routes if getattr(r, "path", None) != "/mcp"]
+        app.mount("/mcp", mcp_app)
+
     dashboard_routes = create_dashboard_routes(
         registry=registry,
         policy=policy,
@@ -82,6 +103,7 @@ def main() -> None:
         audit_log=audit_log,
         config_path=config_path,
         middleware=mw_instance,
+        rebuild_proxy=rebuild_proxy_fn,
     )
 
     # Mount MCP endpoint under /mcp

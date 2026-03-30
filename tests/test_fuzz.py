@@ -219,6 +219,63 @@ class TestJsonStructurePreservation:
         # "status" is not PII, should be unchanged
         assert parsed["status"] == "active"
 
+    @pytest.mark.parametrize("key", [
+        "data", "mark", "grace", "grant", "hunter", "chase", "bill",
+        "response", "christian", "frank", "don", "josh",
+    ])
+    def test_ambiguous_keys_not_masked(self, key: str):
+        """Keys that look like person names must never be altered."""
+        mw = _fresh_middleware()
+        data = {key: "some non-pii value", "other": "hello"}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)
+        assert key in parsed, f"Key {key!r} was removed or renamed"
+        assert parsed[key] == "some non-pii value"
+
+    def test_nested_ambiguous_keys_not_masked(self):
+        """Nested keys that resemble names must survive masking."""
+        mw = _fresh_middleware()
+        data = {
+            "response": {
+                "data": {"mark": "non-pii", "grace": 42},
+                "grant": [1, 2, 3],
+            }
+        }
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)
+        assert parsed["response"]["data"]["mark"] == "non-pii"
+        assert parsed["response"]["data"]["grace"] == 42
+        assert parsed["response"]["grant"] == [1, 2, 3]
+
+    def test_ambiguous_key_with_pii_value(self):
+        """A key that looks like a name should stay, but a PII *value* should be masked."""
+        mw = _fresh_middleware()
+        data = {"grant": "John Smith", "data": "jane.doe@example.com"}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)
+        # Keys must be unchanged
+        assert "grant" in parsed
+        assert "data" in parsed
+        # Values should be masked (not equal to originals)
+        assert parsed["grant"] != "John Smith"
+        assert parsed["data"] != "jane.doe@example.com"
+
+    def test_prescan_does_not_replace_keys(self):
+        """If a known PII value matches a JSON key name, the key must not be replaced."""
+        mw = _fresh_middleware()
+        # First, get "Mark" into the mapping store as a known PII value
+        mw._mask_text("Please contact Mark Johnson about this.")
+        # Now process JSON with "mark" as a key
+        data = {"mark": "non-pii value", "status": "ok"}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)
+        assert "mark" in parsed, "Key 'mark' was replaced by prescan"
+        assert parsed["status"] == "ok"
+
 
 # =========================================================================
 # 4. HTML structure preservation

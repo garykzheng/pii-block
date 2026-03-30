@@ -30,6 +30,37 @@ from operators import (
 logger = logging.getLogger("privacy_middleware")
 
 
+def _find_json_key_spans(text: str) -> list[tuple[int, int]]:
+    """Find character spans of JSON object keys in serialized JSON text.
+
+    Returns a list of (start, end) tuples where each span covers the key
+    content *including* its surrounding quotes, e.g. for ``"data":`` the
+    span covers the ``"data"`` portion.  This allows callers to check
+    whether a Presidio detection or prescan match overlaps a key and skip
+    it.
+
+    Only called when the text is known to be valid JSON.
+    """
+    spans: list[tuple[int, int]] = []
+    # Match a quoted string followed by optional whitespace and a colon.
+    # The regex handles escaped characters inside the string.
+    for m in re.finditer(r'"(?:[^"\\]|\\.)*"\s*:', text):
+        # The key string runs from the opening quote to the closing quote
+        # (exclude the whitespace + colon).
+        key_str = m.group()
+        closing_quote = key_str.rindex('"', 1)
+        spans.append((m.start(), m.start() + closing_quote + 1))
+    return spans
+
+
+def _overlaps_any_span(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    """Return True if [start, end) overlaps with any span in the list."""
+    for s_start, s_end in spans:
+        if start < s_end and end > s_start:
+            return True
+    return False
+
+
 _BLOCK_TAGS = frozenset({
     "br", "p", "div", "li", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5",
     "h6", "blockquote", "pre", "hr", "table", "thead", "tbody", "ul", "ol",
@@ -529,13 +560,26 @@ class PrivacyMiddleware(Middleware):
         # Sort by length descending — replace longer values first
         pairs.sort(key=lambda p: len(p[0]), reverse=True)
 
+        # Pre-compute JSON key spans so we never replace inside keys
+        try:
+            json.loads(text)
+            json_key_spans = _find_json_key_spans(text)
+        except (json.JSONDecodeError, ValueError):
+            json_key_spans = []
+
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
             idx = text.lower().find(real_val.lower())
             while idx != -1:
-                # Don't replace inside already-substituted surrogates or URLs
+                # Don't replace inside JSON keys
+                if json_key_spans and _overlaps_any_span(idx, idx + len(real_val), json_key_spans):
+                    idx = text.lower().find(real_val.lower(), idx + len(real_val))
+                    continue
                 text = text[:idx] + surrogate + text[idx + len(real_val):]
                 count += 1
+                # Recompute key spans since offsets shifted
+                if json_key_spans:
+                    json_key_spans = _find_json_key_spans(text)
                 idx = text.lower().find(real_val.lower(), idx + len(surrogate))
 
         return text, count
@@ -631,14 +675,26 @@ class PrivacyMiddleware(Middleware):
         """Filter out low-quality Presidio detections.
 
         Removes:
+        - Entities that overlap with JSON object keys (only values should be masked)
         - PERSON entities that are too short (< 3 chars), single initials
         - PERSON entities that span newlines (likely multi-line blobs)
         - PERSON entities that look like URLs
         - PERSON entities that are common short words (1-2 chars)
         """
+        # Pre-compute JSON key spans so we can skip detections inside keys
+        try:
+            json.loads(text)
+            json_key_spans = _find_json_key_spans(text)
+        except (json.JSONDecodeError, ValueError):
+            json_key_spans = []
+
         filtered = []
         for r in results:
             value = text[r.start:r.end]
+
+            # Skip entities that fall inside JSON keys
+            if json_key_spans and _overlaps_any_span(r.start, r.end, json_key_spans):
+                continue
 
             if r.entity_type == "PERSON":
                 # Skip very short values (initials, single chars)

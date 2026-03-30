@@ -592,6 +592,9 @@ class PrivacyMiddleware(Middleware):
            (catches structured fields like first_name/last_name and repeat
            appearances of previously-detected PII)
         2. Presidio: detect and mask any *new* PII not yet in the store
+
+        For valid JSON input, masking is applied per-value on the parsed tree
+        and then re-serialized with json.dumps() to guarantee valid output.
         """
         if not text or not text.strip():
             return text, [], 0
@@ -604,9 +607,61 @@ class PrivacyMiddleware(Middleware):
         # that Presidio can't detect without context.
         text, field_count = self._apply_field_rules(text)
 
+        # JSON-safe path: parse, mask individual string values, re-serialize.
+        # This prevents surrogates with special characters from corrupting JSON.
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, (dict, list)):
+                masked_data, json_types, json_count = self._mask_json_tree(parsed)
+                total = field_count + json_count
+                return json.dumps(masked_data, ensure_ascii=False), json_types, total
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Non-JSON path: prescan + Presidio on raw text
+        return self._mask_plain_text(text, field_count)
+
+    def _mask_json_tree(self, obj: Any) -> tuple[Any, list[str], int]:
+        """Walk a parsed JSON tree and mask each string value individually.
+
+        Returns (masked_obj, entity_types, count).
+        """
+        all_types: set[str] = set()
+        total_count = 0
+
+        if isinstance(obj, dict):
+            new_obj = {}
+            for key, value in obj.items():
+                masked_val, types, count = self._mask_json_tree(value)
+                new_obj[key] = masked_val
+                all_types.update(types)
+                total_count += count
+            return new_obj, list(all_types), total_count
+
+        if isinstance(obj, list):
+            new_list = []
+            for item in obj:
+                masked_item, types, count = self._mask_json_tree(item)
+                new_list.append(masked_item)
+                all_types.update(types)
+                total_count += count
+            return new_list, list(all_types), total_count
+
+        if isinstance(obj, str) and obj.strip():
+            masked, types, count = self._mask_plain_text(obj, 0)
+            return masked, types, count
+
+        return obj, [], 0
+
+    def _mask_plain_text(
+        self, text: str, prior_count: int
+    ) -> tuple[str, list[str], int]:
+        """Run prescan + Presidio on a plain text string.
+
+        Used for both non-JSON text and individual JSON string values.
+        Returns (masked_text, entity_types, total_count).
+        """
         # Phase 1: Pre-scan for known real values already in the mapping store.
-        # This catches PII in structured JSON fields and repeat appearances
-        # that Presidio might miss due to lack of context.
         text, prescan_count = self._prescan_known_values(text)
 
         # Build allow list: policy allow_list terms + known surrogates
@@ -633,22 +688,22 @@ class PrivacyMiddleware(Middleware):
             )
         except Exception as e:
             logger.warning("Presidio analysis failed: %s", e)
-            prior_count = field_count + prescan_count
-            if prior_count > 0:
-                return text, [], prior_count
+            accumulated = prior_count + prescan_count
+            if accumulated > 0:
+                return text, [], accumulated
             return text, [], 0
 
         # Filter out low-quality detections
         analyzer_results = self._filter_results(analyzer_results, plain_text)
 
         if not analyzer_results:
-            prior_count = field_count + prescan_count
-            if prior_count > 0:
-                return text, [], prior_count
+            accumulated = prior_count + prescan_count
+            if accumulated > 0:
+                return text, [], accumulated
             return text, [], 0
 
         entity_types = list({r.entity_type for r in analyzer_results})
-        count = len(analyzer_results) + field_count + prescan_count
+        count = len(analyzer_results) + prior_count + prescan_count
 
         if is_html and offset_map is not None:
             # Apply masks directly to the original HTML using offset mapping

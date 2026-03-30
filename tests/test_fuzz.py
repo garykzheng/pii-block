@@ -277,6 +277,67 @@ class TestJsonStructurePreservation:
         assert parsed["status"] == "ok"
 
 
+class TestJsonEscapingSafety:
+    """Surrogates with special characters must not corrupt JSON output."""
+
+    def test_value_with_apostrophe_stays_valid_json(self):
+        """A value containing an apostrophe must be properly escaped in output."""
+        mw = _fresh_middleware()
+        # Force a surrogate with an apostrophe into the mapping store
+        mw.mapping_store.store("PERSON", "Jane Doe", "Mary O'Brien")
+        data = {"name": "Jane Doe", "role": "engineer"}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)  # Must not raise
+        assert parsed["role"] == "engineer"
+        assert "Jane Doe" not in masked
+
+    def test_value_with_double_quote_stays_valid_json(self):
+        """A surrogate containing a double quote must not break JSON."""
+        mw = _fresh_middleware()
+        mw.mapping_store.store("PERSON", "John Smith", 'John "The Rock" Smith')
+        data = {"contact": "John Smith", "count": 5}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)  # Must not raise
+        assert parsed["count"] == 5
+        assert "John Smith" not in json.dumps(parsed)
+
+    def test_value_with_backslash_stays_valid_json(self):
+        """A surrogate containing backslashes must not break JSON."""
+        mw = _fresh_middleware()
+        mw.mapping_store.store("PERSON", "Alice Jones", "Alice\\Jones")
+        data = {"user": "Alice Jones", "active": True}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)  # Must not raise
+        assert parsed["active"] is True
+
+    def test_value_with_newline_stays_valid_json(self):
+        """A surrogate containing a newline must not break JSON."""
+        mw = _fresh_middleware()
+        mw.mapping_store.store("PERSON", "Bob Brown", "Bob\nBrown")
+        data = {"name": "Bob Brown", "status": "ok"}
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)  # Must not raise
+        assert parsed["status"] == "ok"
+
+    def test_long_body_with_special_chars_stays_valid_json(self):
+        """Real-world scenario: HTML body text with PII in a JSON response."""
+        mw = _fresh_middleware()
+        data = {
+            "subject": "Meeting with Robert Johnson",
+            "body": '<p>Hi Robert Johnson,</p><p>Let\'s meet at "The Office" on Monday.</p>',
+            "id": 42,
+        }
+        text = json.dumps(data)
+        masked = mw._mask_text(text)
+        parsed = json.loads(masked)  # Must not raise
+        assert parsed["id"] == 42
+        assert "Robert Johnson" not in json.dumps(parsed)
+
+
 # =========================================================================
 # 4. HTML structure preservation
 # =========================================================================

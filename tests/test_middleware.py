@@ -215,3 +215,76 @@ class TestMiddlewareListContent:
         result = await self.mw.on_call_tool(context, call_next)
 
         assert result is None
+
+
+class TestSurrogateNotice:
+    """The proxy should append a privacy notice when PII is masked."""
+
+    def setup_method(self):
+        self.store = MappingStore()
+        self.mw = PrivacyMiddleware(
+            policy=make_policy(),
+            mapping_store=self.store,
+            fpe_key=TEST_KEY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_notice_appended_when_pii_masked(self):
+        """String results with PII should include the surrogate notice."""
+        context = FakeContext(FakeMessage("get_user", {"id": "1"}))
+
+        async def call_next(ctx):
+            return "The user is John Smith."
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        assert "John Smith" not in result
+        assert "privacy surrogates" in result
+
+    @pytest.mark.asyncio
+    async def test_no_notice_when_no_pii(self):
+        """Results without PII should not include the notice."""
+        context = FakeContext(FakeMessage("list_items", {}))
+
+        async def call_next(ctx):
+            return "Item 1: Widget, Item 2: Gadget"
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        assert "surrogate" not in result
+
+    @pytest.mark.asyncio
+    async def test_notice_disabled_by_policy(self):
+        """When surrogate_notice is False, no notice should be appended."""
+        policy = make_policy()
+        policy.surrogate_notice = False
+        mw = PrivacyMiddleware(
+            policy=policy,
+            mapping_store=MappingStore(),
+            fpe_key=TEST_KEY,
+        )
+        context = FakeContext(FakeMessage("get_user", {"id": "1"}))
+
+        async def call_next(ctx):
+            return "The user is John Smith."
+
+        result = await mw.on_call_tool(context, call_next)
+
+        assert "John Smith" not in result
+        assert "surrogate" not in result
+
+    @pytest.mark.asyncio
+    async def test_notice_appended_to_list_result(self):
+        """List results with PII should include the notice as a trailing item."""
+        context = FakeContext(FakeMessage("get_records", {}))
+
+        async def call_next(ctx):
+            return ["Record: SSN 456-78-9012"]
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert "456-78-9012" not in result[0]
+        assert hasattr(result[-1], "text")
+        assert "privacy surrogates" in result[-1].text

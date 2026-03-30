@@ -58,6 +58,7 @@ class PolicyConfig:
     custom_recognizers: list[CustomRecognizer] = field(default_factory=list)
     field_rules: list[FieldRule] = field(default_factory=list)
     allow_list: list[str] = field(default_factory=list)
+    surrogate_notice: bool = True
 
     def get_entity_policy(self, entity_type: str) -> EntityPolicy:
         """Return the policy for a given entity type, falling back to DEFAULT."""
@@ -108,12 +109,14 @@ def load_policy(path: str | Path) -> PolicyConfig:
         ))
 
     allow_list: list[str] = raw.get("allow_list", [])
+    surrogate_notice: bool = raw.get("surrogate_notice", True)
 
     return PolicyConfig(
         entities=entities,
         custom_recognizers=custom_recognizers,
         field_rules=field_rules,
         allow_list=allow_list,
+        surrogate_notice=surrogate_notice,
     )
 
 
@@ -158,6 +161,9 @@ def save_policy(policy: PolicyConfig, path: str | Path) -> None:
 
     if policy.allow_list:
         data["allow_list"] = policy.allow_list
+
+    if not policy.surrogate_notice:
+        data["surrogate_notice"] = False
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:

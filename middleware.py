@@ -17,6 +17,7 @@ from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig, RecognizerResult
 
+from mcp.types import TextContent
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from audit import AuditLog, AuditEvent
@@ -239,7 +240,35 @@ class PrivacyMiddleware(Middleware):
                 masked_count=masked_count,
             ))
 
+        # Append a notice so the LLM knows names in the response are surrogates
+        if masked_count > 0 and self.policy.surrogate_notice:
+            masked_result = self._append_surrogate_notice(masked_result, entity_types)
+
         return masked_result
+
+    # ── Surrogate notice ───────────────────────────────────────────────────
+
+    _SURROGATE_NOTICE = (
+        "[Privacy note: Person names and other PII in this response have been "
+        "replaced with privacy surrogates. They may differ from the names the "
+        "user provided. Use the surrogate names as-is when referencing these "
+        "entities.]"
+    )
+
+    def _append_surrogate_notice(self, result: Any, entity_types: list[str]) -> Any:
+        """Append a short privacy notice to a tool result when PII was masked."""
+        notice = TextContent(type="text", text=self._SURROGATE_NOTICE)
+
+        if hasattr(result, "content") and isinstance(result.content, list):
+            new_content = list(result.content) + [notice]
+            if hasattr(result, "model_copy"):
+                return result.model_copy(update={"content": new_content})
+        elif isinstance(result, list):
+            return list(result) + [notice]
+        elif isinstance(result, str):
+            return result + "\n\n" + self._SURROGATE_NOTICE
+
+        return result
 
     # ── Resource read interception ────────────────────────────────────────
 

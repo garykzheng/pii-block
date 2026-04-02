@@ -131,13 +131,23 @@ def _rewrite_www_authenticate(header: str, proxy_origin: str, prefix: str) -> st
 
 
 def _rewrite_resource_metadata(body: bytes, proxy_origin: str, prefix: str) -> bytes:
-    """Rewrite the 'resource' field in OAuth protected resource metadata."""
+    """Rewrite OAuth protected resource metadata to route through proxy.
+
+    Rewrites both ``resource`` and ``authorization_servers`` so the SDK
+    performs all OAuth discovery through the proxy rather than directly
+    contacting the backend (which would return unrewritten metadata).
+    """
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, ValueError):
         return body
-    if isinstance(data, dict) and "resource" in data:
-        data["resource"] = f"{proxy_origin}{prefix}"
+    if isinstance(data, dict):
+        if "resource" in data:
+            data["resource"] = f"{proxy_origin}{prefix}"
+        if "authorization_servers" in data:
+            # Route auth server discovery through the proxy too so the SDK
+            # can't bypass us and fetch unrewritten metadata directly.
+            data["authorization_servers"] = [f"{proxy_origin}{prefix}"]
     return json.dumps(data, ensure_ascii=False).encode()
 
 

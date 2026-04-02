@@ -31,8 +31,20 @@ _DEFAULT_TOKEN_DIR = (
 
 def _get_token_store():
     """Get the shared FileTreeStore for OAuth token persistence."""
-    from key_value.aio.stores.filetree.store import FileTreeStore
-    return FileTreeStore(data_directory=_DEFAULT_TOKEN_DIR)
+    from key_value.aio.stores.filetree.store import (
+        FileTreeStore,
+        FileTreeV1CollectionSanitizationStrategy,
+        FileTreeV1KeySanitizationStrategy,
+    )
+    return FileTreeStore(
+        data_directory=_DEFAULT_TOKEN_DIR,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(
+            _DEFAULT_TOKEN_DIR,
+        ),
+        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
+            _DEFAULT_TOKEN_DIR,
+        ),
+    )
 
 
 def _has_saved_tokens(url: str) -> bool:

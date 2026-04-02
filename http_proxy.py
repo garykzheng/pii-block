@@ -167,6 +167,8 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
 
         body = await request.body()
 
+        logger.info(f"→ {request.method} {request.url} => {target_url}")
+
         async with httpx.AsyncClient(follow_redirects=False) as client:
             backend_resp = await client.request(
                 method=request.method,
@@ -183,6 +185,8 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
         }
 
         resp_body = backend_resp.content
+
+        logger.info(f"← {backend_resp.status_code} {target_url}")
 
         # Rewrite OAuth URLs so Claude Code's SDK accepts the proxy origin
         if backend_resp.status_code == 401 and "www-authenticate" in resp_headers:
@@ -249,6 +253,34 @@ def create_app(
                 Route("/{path:path}", handler, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]),
                 Route("/", handler, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]),
             ]))
+
+        # Catch-all: handle .well-known discovery at root level.
+        # MCP OAuth SDKs may try fallback URLs like:
+        #   /.well-known/oauth-protected-resource/<name>
+        # Route these to the correct backend.
+        async def wellknown_fallback(request: Request) -> Response:
+            path = request.url.path
+            # Check if path matches /.well-known/oauth-protected-resource/<name>
+            for name, url in backends.items():
+                if path.rstrip("/").endswith(f"/{name}"):
+                    prefix = f"/{name}"
+                    proxy_origin = f"{request.url.scheme}://{request.url.netloc}"
+                    # Fetch from backend
+                    backend = url.rstrip("/")
+                    target = f"{backend}/.well-known/oauth-protected-resource"
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(target, timeout=30.0)
+                    body = resp.content
+                    if resp.status_code == 200 and b"resource" in body:
+                        body = _rewrite_resource_metadata(body, proxy_origin, prefix)
+                    resp_headers = {
+                        k: v for k, v in resp.headers.items()
+                        if k.lower() not in _HOP_BY_HOP
+                    }
+                    return Response(content=body, status_code=resp.status_code, headers=resp_headers)
+            return Response(content=b"Not Found", status_code=404)
+
+        routes.append(Route("/.well-known/{path:path}", wellknown_fallback, methods=["GET"]))
     else:
         raise ValueError("Provide either backend_url or backends")
 

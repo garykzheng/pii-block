@@ -34,10 +34,18 @@ class ServerRegistry:
             self.load(self._path)
 
     @classmethod
-    def from_single(cls, target: str, name: str = "default") -> ServerRegistry:
+    def from_single(
+        cls,
+        target: str,
+        name: str = "default",
+        auth: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> ServerRegistry:
         """Create a registry with a single server (backwards compat with env vars)."""
         registry = cls()
-        registry._servers[name] = ServerEntry(target=target)
+        registry._servers[name] = ServerEntry(
+            target=target, auth=auth, headers=headers,
+        )
         return registry
 
     def load(self, path: str | Path | None = None) -> None:

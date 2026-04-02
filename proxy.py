@@ -6,10 +6,12 @@ middleware.
 CLI usage (pass-through mode for .mcp.json integration):
     python proxy.py -- npx @playwright/mcp@latest --config config.json
     python proxy.py --backend-url http://localhost:3456/mcp
+    python proxy.py --auth oauth --backend-url https://mcp.slack.com/mcp
 
 Environment variables (optional overrides):
     BACKEND_URL        — URL of the backend MCP server (SSE/HTTP)
     BACKEND_COMMAND    — Command to spawn a stdio backend (e.g. "python server.py")
+    BACKEND_AUTH       — Auth mode: "oauth" for browser-based OAuth, or a bearer token
     FPE_KEY            — Hex-encoded 128/192/256-bit key for format-preserving encryption
     MAPPING_STORE_PATH — Path to JSON file for persisting PII mappings
                          (default: ~/Library/Application Support/mcp-privacy-proxy/mappings.json)
@@ -23,6 +25,11 @@ Environment variables (optional overrides):
           "type": "stdio",
           "command": "python",
           "args": ["proxy.py", "--", "npx", "@playwright/mcp@latest"]
+        },
+        "slack": {
+          "type": "stdio",
+          "command": "python",
+          "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.slack.com/mcp"]
         }
       }
     }
@@ -42,15 +49,16 @@ from server_registry import ServerRegistry
 from core import build_proxy
 
 
-def _parse_cli_args() -> tuple[str | None, str | None]:
-    """Parse CLI arguments for --backend-url and -- pass-through command.
+def _parse_cli_args() -> tuple[str | None, str | None, str | None]:
+    """Parse CLI arguments for --backend-url, --auth, and -- pass-through command.
 
-    Returns (backend_url, backend_command) from CLI args, or (None, None)
+    Returns (backend_url, backend_command, auth) from CLI args, or (None, None, None)
     if no CLI args were provided.
     """
     argv = sys.argv[1:]
     backend_url = None
     backend_command = None
+    auth = None
 
     # Check for -- pass-through: everything after -- is the backend command
     if "--" in argv:
@@ -61,25 +69,29 @@ def _parse_cli_args() -> tuple[str | None, str | None]:
             backend_command = " ".join(shlex.quote(a) for a in remaining)
         argv = prefix
 
-    # Check for --backend-url
+    # Check for --backend-url and --auth
     i = 0
     while i < len(argv):
         if argv[i] == "--backend-url" and i + 1 < len(argv):
             backend_url = argv[i + 1]
             i += 2
+        elif argv[i] == "--auth" and i + 1 < len(argv):
+            auth = argv[i + 1]
+            i += 2
         else:
             i += 1
 
-    return backend_url, backend_command
+    return backend_url, backend_command, auth
 
 
 def main() -> None:
     # ── CLI arguments (override env vars) ─────────────────────────────
-    cli_url, cli_command = _parse_cli_args()
+    cli_url, cli_command, cli_auth = _parse_cli_args()
 
     # ── Resolve configuration ─────────────────────────────────────────
     backend_url = cli_url or os.environ.get("BACKEND_URL")
     backend_command = cli_command or os.environ.get("BACKEND_COMMAND")
+    auth = cli_auth or os.environ.get("BACKEND_AUTH")
     servers_path = os.environ.get("SERVERS_PATH", "servers.yaml")
 
     fpe_key = os.environ.get(
@@ -109,7 +121,7 @@ def main() -> None:
     # ── Build server registry ─────────────────────────────────────────
     # CLI args take priority, then servers.yaml, then env vars
     if backend_url:
-        registry = ServerRegistry.from_single(backend_url)
+        registry = ServerRegistry.from_single(backend_url, auth=auth)
     elif backend_command:
         registry = ServerRegistry.from_single(backend_command)
     elif Path(servers_path).exists():

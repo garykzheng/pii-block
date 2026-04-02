@@ -7,10 +7,12 @@ servers from the registry.
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 from fastmcp.client.transports import NodeStdioTransport, PythonStdioTransport
+from fastmcp.client.transports.stdio import NpxStdioTransport
 from fastmcp.server import create_proxy
 
 from middleware import PrivacyMiddleware
@@ -21,19 +23,44 @@ if TYPE_CHECKING:
     from mapping_store import MappingStore
     from server_registry import ServerRegistry
 
+_DEFAULT_TOKEN_DIR = (
+    Path.home() / "Library" / "Application Support" / "mcp-privacy-proxy" / "oauth"
+)
 
-def _parse_target(target: str):
+
+def _build_oauth(url: str):
+    """Build an OAuth instance with persistent file-based token storage."""
+    from fastmcp.client.auth.oauth import OAuth
+    from key_value.aio.stores.filetree.store import FileTreeStore
+
+    store = FileTreeStore(data_directory=_DEFAULT_TOKEN_DIR)
+    return OAuth(mcp_url=url, token_storage=store)
+
+
+def _parse_target(
+    target: str,
+    auth: str | None = None,
+    headers: dict[str, str] | None = None,
+):
     """Convert a target string into a transport that FastMCP understands.
 
     Handles:
-    - URLs (http://, https://) — passed through as-is
+    - URLs (http://, https://) — creates StreamableHttpTransport with auth
     - File paths ending in .py or .js — passed through as-is
     - Command strings (e.g. "node mcp/index.js") — parsed into the
       appropriate stdio transport
     """
-    # URLs: pass through for FastMCP to handle
+    # URLs: create HTTP transport with auth support
     if target.startswith(("http://", "https://")):
-        return target
+        from fastmcp.client.transports import StreamableHttpTransport
+        kwargs: dict = {"url": target}
+        if auth == "oauth":
+            kwargs["auth"] = _build_oauth(target)
+        elif auth is not None:
+            kwargs["auth"] = auth
+        if headers is not None:
+            kwargs["headers"] = headers
+        return StreamableHttpTransport(**kwargs)
 
     parts = shlex.split(target)
 
@@ -45,10 +72,15 @@ def _parse_target(target: str):
     cmd = parts[0]
     args = parts[1:]
 
-    if cmd in ("node", "npx"):
+    if cmd == "npx":
         if not args:
-            raise ValueError(f"Node command needs a script or package: {target}")
-        return NodeStdioTransport(script_path=args[0], args=args[1:], node_cmd=cmd)
+            raise ValueError(f"npx command needs a package name: {target}")
+        return NpxStdioTransport(package=args[0], args=args[1:])
+
+    if cmd == "node":
+        if not args:
+            raise ValueError(f"Node command needs a script: {target}")
+        return NodeStdioTransport(script_path=args[0], args=args[1:])
 
     if cmd == "python" or cmd == "python3":
         if not args:
@@ -87,13 +119,10 @@ def build_proxy(
     # Mount each enabled server
     enabled = registry.enabled_servers()
     for name, entry in enabled.items():
-        kwargs: dict = {}
-        if entry.auth:
-            kwargs["auth"] = entry.auth
-        if entry.headers:
-            kwargs["headers"] = entry.headers
-        transport = _parse_target(entry.target)
-        child = create_proxy(transport, **kwargs)
+        transport = _parse_target(
+            entry.target, auth=entry.auth, headers=entry.headers,
+        )
+        child = create_proxy(transport)
 
         # Single server: don't namespace, so tool names pass through unchanged
         if len(enabled) == 1:

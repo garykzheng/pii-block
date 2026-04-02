@@ -69,40 +69,30 @@ def _build_oauth(url: str):
     return OAuth(mcp_url=url, token_storage=_get_token_store())
 
 
-def _build_auth_placeholder(url: str) -> FastMCP:
-    """Build a minimal MCP server with just an ``authenticate`` tool.
+def _do_oauth_flow(url: str) -> None:
+    """Run the OAuth browser flow synchronously and save tokens to disk.
 
-    Returned when a backend requires OAuth but no tokens are saved yet.
-    The tool triggers the browser-based OAuth flow and saves tokens to disk.
-    After authenticating, the user restarts the MCP server to load real tools.
+    Opens a browser for authorization, waits for the callback, exchanges
+    the code for tokens, and persists them via the FileTreeStore. Blocks
+    until the flow completes (up to 5 minutes).
     """
-    placeholder = FastMCP("OAuth Required")
+    import sys
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
 
-    @placeholder.tool()
-    async def authenticate() -> str:
-        """Authenticate with the backend MCP server via OAuth.
+    print(f"[pii-proxy] No saved OAuth tokens for {url}", file=sys.stderr)
+    print(f"[pii-proxy] Opening browser for authentication...", file=sys.stderr)
 
-        Opens a browser for the OAuth authorization flow. After
-        authenticating, restart this MCP server to access the full
-        set of tools.
-        """
-        from fastmcp import Client
-        from fastmcp.client.transports import StreamableHttpTransport
+    oauth = _build_oauth(url)
+    transport = StreamableHttpTransport(url=url, auth=oauth)
 
-        oauth = _build_oauth(url)
-        transport = StreamableHttpTransport(url=url, auth=oauth)
-        # Connect using FastMCP's Client — this properly drives the full
-        # OAuth flow (metadata discovery, client registration, browser
-        # redirect, callback, token exchange) and saves tokens to disk.
+    async def _auth():
         async with Client(transport=transport, timeout=300) as client:
             tools = await client.list_tools()
-        return (
-            f"Authentication successful! Found {len(tools)} tools. "
-            "Tokens have been saved. Please restart this MCP server "
-            "(via /mcp) to load the backend tools."
-        )
+        return len(tools)
 
-    return placeholder
+    n = asyncio.run(_auth())
+    print(f"[pii-proxy] Authenticated! Found {n} tools.", file=sys.stderr)
 
 
 def _parse_target(
@@ -173,9 +163,9 @@ def build_proxy(
     - PrivacyMiddleware attached (applies to all mounted children)
     - Each enabled server from the registry mounted under its name
 
-    For OAuth backends without saved tokens, a placeholder server with just
-    an ``authenticate`` tool is mounted instead. After the user authenticates
-    and restarts the server, the full backend tools become available.
+    For OAuth backends without saved tokens, the browser-based OAuth flow
+    runs automatically during startup. Once tokens are saved, subsequent
+    starts skip the auth flow.
     """
     parent = FastMCP("MCP Privacy Proxy")
 
@@ -191,15 +181,14 @@ def build_proxy(
     # Mount each enabled server
     enabled = registry.enabled_servers()
     for name, entry in enabled.items():
-        # OAuth backends without saved tokens get a placeholder with just
-        # an authenticate tool — no browser popup on startup
+        # OAuth backends without saved tokens: do the browser flow now
         if entry.auth == "oauth" and not _has_saved_tokens(entry.target):
-            child = _build_auth_placeholder(entry.target)
-        else:
-            transport = _parse_target(
-                entry.target, auth=entry.auth, headers=entry.headers,
-            )
-            child = create_proxy(transport)
+            _do_oauth_flow(entry.target)
+
+        transport = _parse_target(
+            entry.target, auth=entry.auth, headers=entry.headers,
+        )
+        child = create_proxy(transport)
 
         # Single server: don't namespace, so tool names pass through unchanged
         if len(enabled) == 1:

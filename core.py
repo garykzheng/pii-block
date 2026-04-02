@@ -86,15 +86,18 @@ def _build_auth_placeholder(url: str) -> FastMCP:
         authenticating, restart this MCP server to access the full
         set of tools.
         """
-        import httpx
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
 
         oauth = _build_oauth(url)
-        # Make a request to the backend with OAuth — this triggers the
-        # browser-based flow (redirect + callback) and saves tokens to disk.
-        async with httpx.AsyncClient(auth=oauth) as client:
-            response = await client.get(url, timeout=120.0)
+        transport = StreamableHttpTransport(url=url, auth=oauth)
+        # Connect using FastMCP's Client — this properly drives the full
+        # OAuth flow (metadata discovery, client registration, browser
+        # redirect, callback, token exchange) and saves tokens to disk.
+        async with Client(transport=transport, timeout=300) as client:
+            tools = await client.list_tools()
         return (
-            f"Authentication successful (HTTP {response.status_code}). "
+            f"Authentication successful! Found {len(tools)} tools. "
             "Tokens have been saved. Please restart this MCP server "
             "(via /mcp) to load the backend tools."
         )

@@ -64,6 +64,7 @@ _HOP_BY_HOP = frozenset({
     "transfer-encoding", "connection", "keep-alive", "proxy-authenticate",
     "proxy-authorization", "te", "trailers", "upgrade",
     "content-length",  # recalculated after PII masking may change body size
+    "content-encoding",  # httpx auto-decompresses; don't forward stale encoding
     "host",  # set to backend host
 })
 
@@ -168,10 +169,14 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
         if prefix:
             path = path[len(prefix):]
 
-        # .well-known URLs are always relative to the origin, not the
-        # backend's sub-path (e.g. /mcp). RFC 8615 requires them at root.
-        if "/.well-known/" in path:
+        # .well-known URLs are normally at the origin root (RFC 8615),
+        # but some servers (e.g. Sentry) serve them under the sub-path.
+        # Try origin root first, fall back to sub-path if 404.
+        is_wellknown = "/.well-known/" in path
+        if is_wellknown:
             target_url = f"{backend_origin}{path}"
+        elif path in ("", "/"):
+            target_url = backend
         else:
             target_url = f"{backend}{path}"
         if request.url.query:
@@ -199,6 +204,19 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
                 content=body,
                 timeout=120.0,
             )
+
+            # .well-known fallback: if origin root returned 404, try with
+            # the backend sub-path appended (some servers like Sentry
+            # serve metadata under the sub-path instead of the origin).
+            if is_wellknown and backend_resp.status_code == 404:
+                fallback_url = f"{backend}{path}"
+                backend_resp = await client.request(
+                    method=request.method,
+                    url=fallback_url,
+                    headers=headers,
+                    content=body,
+                    timeout=120.0,
+                )
 
         # Forward response headers (skip hop-by-hop)
         resp_headers = {
@@ -292,11 +310,19 @@ def create_app(
                     bk_origin = f"{bk_parsed.scheme}://{bk_parsed.host}"
                     if bk_parsed.port and bk_parsed.port not in (80, 443):
                         bk_origin += f":{bk_parsed.port}"
-                    # Strip the backend name from the path to get the .well-known type
+                    # Strip the backend name to get the .well-known type
                     wellknown_path = path[:path.rstrip("/").rfind(f"/{name}")]
-                    target = f"{bk_origin}{wellknown_path}"
+                    bk_subpath = bk_parsed.path.rstrip("/")
+                    # Try origin root first, then with backend sub-path
+                    targets = [f"{bk_origin}{wellknown_path}"]
+                    if bk_subpath:
+                        targets.append(f"{bk_origin}{wellknown_path}{bk_subpath}")
+                    resp = None
                     async with httpx.AsyncClient() as client:
-                        resp = await client.get(target, timeout=30.0)
+                        for target in targets:
+                            resp = await client.get(target, timeout=30.0)
+                            if resp.status_code == 200:
+                                break
                     body = resp.content
                     if resp.status_code == 200 and b"resource" in body:
                         body = _rewrite_resource_metadata(body, proxy_origin, bk_prefix)

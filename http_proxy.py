@@ -146,12 +146,24 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
     # Normalize: strip trailing slash from backend
     backend = backend_url.rstrip("/")
 
+    # Backend origin (scheme + host) for .well-known requests
+    backend_parsed = httpx.URL(backend)
+    backend_origin = f"{backend_parsed.scheme}://{backend_parsed.host}"
+    if backend_parsed.port and backend_parsed.port not in (80, 443):
+        backend_origin += f":{backend_parsed.port}"
+
     async def proxy_endpoint(request: Request) -> Response:
         # Build the backend URL, appending any sub-path after the prefix
         path = request.url.path
         if prefix:
             path = path[len(prefix):]
-        target_url = f"{backend}{path}"
+
+        # .well-known URLs are always relative to the origin, not the
+        # backend's sub-path (e.g. /mcp). RFC 8615 requires them at root.
+        if "/.well-known/" in path:
+            target_url = f"{backend_origin}{path}"
+        else:
+            target_url = f"{backend}{path}"
         if request.url.query:
             target_url += f"?{request.url.query}"
 
@@ -260,19 +272,24 @@ def create_app(
         # Route these to the correct backend.
         async def wellknown_fallback(request: Request) -> Response:
             path = request.url.path
-            # Check if path matches /.well-known/oauth-protected-resource/<name>
+            # Check if path matches /.well-known/<type>/<name>
             for name, url in backends.items():
                 if path.rstrip("/").endswith(f"/{name}"):
-                    prefix = f"/{name}"
+                    bk_prefix = f"/{name}"
                     proxy_origin = f"{request.url.scheme}://{request.url.netloc}"
-                    # Fetch from backend
-                    backend = url.rstrip("/")
-                    target = f"{backend}/.well-known/oauth-protected-resource"
+                    # .well-known is relative to origin, not backend sub-path
+                    bk_parsed = httpx.URL(url)
+                    bk_origin = f"{bk_parsed.scheme}://{bk_parsed.host}"
+                    if bk_parsed.port and bk_parsed.port not in (80, 443):
+                        bk_origin += f":{bk_parsed.port}"
+                    # Strip the backend name from the path to get the .well-known type
+                    wellknown_path = path[:path.rstrip("/").rfind(f"/{name}")]
+                    target = f"{bk_origin}{wellknown_path}"
                     async with httpx.AsyncClient() as client:
                         resp = await client.get(target, timeout=30.0)
                     body = resp.content
                     if resp.status_code == 200 and b"resource" in body:
-                        body = _rewrite_resource_metadata(body, proxy_origin, prefix)
+                        body = _rewrite_resource_metadata(body, proxy_origin, bk_prefix)
                     resp_headers = {
                         k: v for k, v in resp.headers.items()
                         if k.lower() not in _HOP_BY_HOP

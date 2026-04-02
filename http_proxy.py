@@ -119,6 +119,28 @@ def _mask_jsonrpc_response(body: bytes, mw: PrivacyMiddleware) -> bytes:
     return json.dumps(masked, ensure_ascii=False).encode()
 
 
+def _rewrite_www_authenticate(header: str, proxy_origin: str, prefix: str) -> str:
+    """Rewrite resource_metadata URLs in WWW-Authenticate to point to proxy."""
+    # Replace resource_metadata="https://backend/.well-known/..."
+    # with resource_metadata="http://localhost:PORT/prefix/.well-known/..."
+    return re.sub(
+        r'resource_metadata="[^"]*"',
+        f'resource_metadata="{proxy_origin}{prefix}/.well-known/oauth-protected-resource"',
+        header,
+    )
+
+
+def _rewrite_resource_metadata(body: bytes, proxy_origin: str, prefix: str) -> bytes:
+    """Rewrite the 'resource' field in OAuth protected resource metadata."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return body
+    if isinstance(data, dict) and "resource" in data:
+        data["resource"] = f"{proxy_origin}{prefix}"
+    return json.dumps(data, ensure_ascii=False).encode()
+
+
 def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = ""):
     """Create a Starlette endpoint that reverse-proxies to a backend."""
     # Normalize: strip trailing slash from backend
@@ -132,6 +154,9 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
         target_url = f"{backend}{path}"
         if request.url.query:
             target_url += f"?{request.url.query}"
+
+        # Proxy origin as seen by the client (for OAuth URL rewriting)
+        proxy_origin = f"{request.url.scheme}://{request.url.netloc}"
 
         # Forward headers (skip hop-by-hop)
         headers = {
@@ -159,12 +184,23 @@ def _create_proxy_route(backend_url: str, mw: PrivacyMiddleware, prefix: str = "
 
         resp_body = backend_resp.content
 
-        # Apply PII masking on successful JSON-RPC responses
+        # Rewrite OAuth URLs so Claude Code's SDK accepts the proxy origin
+        if backend_resp.status_code == 401 and "www-authenticate" in resp_headers:
+            resp_headers["www-authenticate"] = _rewrite_www_authenticate(
+                resp_headers["www-authenticate"], proxy_origin, prefix,
+            )
+
+        # Rewrite protected resource metadata
         content_type = backend_resp.headers.get("content-type", "")
+        if "oauth-protected-resource" in request.url.path and "json" in content_type:
+            resp_body = _rewrite_resource_metadata(resp_body, proxy_origin, prefix)
+
+        # Apply PII masking on successful JSON-RPC responses
         if (
             backend_resp.status_code == 200
             and "json" in content_type
             and resp_body
+            and "oauth-protected-resource" not in request.url.path
         ):
             resp_body = _mask_jsonrpc_response(resp_body, mw)
 

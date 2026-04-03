@@ -113,12 +113,33 @@ def _refresh_saved_token(url: str) -> bool:
         if not tokens or not tokens.refresh_token or not client_info:
             return False
 
-        # Find the token endpoint from OAuth server metadata
-        # Try the well-known endpoint on the authorization server
-        resp = httpx.get(f"{url.rstrip('/')}/.well-known/oauth-protected-resource", timeout=10)
-        if resp.status_code != 200:
+        # Find the token endpoint from OAuth server metadata.
+        # Try origin root first, then with the backend sub-path (Sentry).
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port and parsed.port not in (80, 443):
+            origin += f":{parsed.port}"
+        subpath = parsed.path.rstrip("/")
+
+        prm = None
+        for wellknown_url in [
+            f"{origin}/.well-known/oauth-protected-resource",
+            f"{origin}/.well-known/oauth-protected-resource{subpath}" if subpath else None,
+        ]:
+            if not wellknown_url:
+                continue
+            resp = httpx.get(wellknown_url, timeout=10)
+            if resp.status_code == 200:
+                try:
+                    prm = resp.json()
+                    if "authorization_servers" in prm:
+                        break
+                    prm = None
+                except Exception:
+                    pass
+        if not prm:
             return False
-        prm = resp.json()
         auth_server = (prm.get("authorization_servers") or [None])[0]
         if not auth_server:
             return False

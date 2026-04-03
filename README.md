@@ -48,12 +48,12 @@ python -m spacy download en_core_web_lg
 
 ### Option 1: Stdio mode (for `.mcp.json` integration)
 
-Wrap any MCP server by putting the proxy in front of it:
+**Wrap a local MCP server** by putting the proxy in front of it:
 
 ```json
 {
   "mcpServers": {
-    "my-server": {
+    "playwright": {
       "type": "stdio",
       "command": "python",
       "args": ["proxy.py", "--", "npx", "@playwright/mcp@latest"]
@@ -62,7 +62,43 @@ Wrap any MCP server by putting the proxy in front of it:
 }
 ```
 
-Or connect to a remote MCP server:
+**Connect to a remote MCP server with OAuth** (e.g. Pylon, Linear, Sentry):
+
+```json
+{
+  "mcpServers": {
+    "pylon": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.usepylon.com/"]
+    }
+  }
+}
+```
+
+On first connect, a browser window opens for OAuth authentication. Tokens are saved to disk — subsequent starts connect instantly without re-auth.
+
+**Servers that require a pre-registered OAuth client** (e.g. Slack) can pass the client ID and callback port via environment variables:
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.slack.com/mcp"],
+      "env": {
+        "OAUTH_CLIENT_ID": "your-workspace-client-id",
+        "OAUTH_CALLBACK_PORT": "3118"
+      }
+    }
+  }
+}
+```
+
+Most MCP servers (Linear, Pylon, Sentry, Datadog) support dynamic client registration and need no extra config — just `--auth oauth` and `--backend-url`.
+
+**Connect to a remote server without OAuth:**
 
 ```json
 {
@@ -103,6 +139,8 @@ python manage.py servers add my-api "http://localhost:3000/mcp"
 | `CONFIG_PATH` | `default_policy.yaml` | Path to the policy YAML file |
 | `MAPPING_STORE_PATH` | `~/Library/Application Support/mcp-privacy-proxy/mappings.json` | Path to the encrypted PII mapping store |
 | `SERVERS_PATH` | `servers.yaml` | Path to the server registry file |
+| `OAUTH_CLIENT_ID` | — | Pre-registered OAuth client ID (for servers without dynamic registration, e.g. Slack) |
+| `OAUTH_CALLBACK_PORT` | Random | Fixed port for the OAuth callback server |
 | `HOST` | `127.0.0.1` | Bind address (HTTP mode only) |
 | `PORT` | `8080` | Listen port (HTTP mode only) |
 | `DASHBOARD_URL` | `http://127.0.0.1:8080` | Dashboard URL for remote audit logging (stdio mode only) |
@@ -210,6 +248,15 @@ Stdio proxy instances automatically push audit events to the dashboard when it's
 pip install -e ".[dev]"
 pytest
 ```
+
+## How OAuth works
+
+When `--auth oauth` is specified, the proxy handles the full OAuth lifecycle:
+
+1. **First connection** — opens a browser for OAuth authorization, saves tokens to `~/Library/Application Support/mcp-privacy-proxy/oauth/`
+2. **Subsequent connections** — loads saved tokens and preemptively refreshes them (handles short-lived tokens like Pylon's 5-minute TTL)
+3. **Token refresh** — automatically refreshes expired access tokens using the stored refresh token
+4. **De-mapping across servers** — the mapping store is shared across all proxy instances, so surrogates from one server (e.g. Pylon) are correctly de-mapped when passed to another (e.g. Slack)
 
 ## Limitations
 

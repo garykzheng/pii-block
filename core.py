@@ -90,6 +90,69 @@ def _build_oauth(
     return oauth
 
 
+def _refresh_saved_token(url: str) -> bool:
+    """Preemptively refresh the saved OAuth token for the given URL.
+
+    Short-lived tokens (like Pylon's 5-minute TTL) expire before the SDK's
+    internal refresh logic triggers. This function does a manual refresh
+    at startup so the proxy always starts with a fresh token.
+
+    Returns True if refresh succeeded, False otherwise.
+    """
+    import sys
+    import httpx
+    from fastmcp.client.auth.oauth import TokenStorageAdapter
+    from mcp.shared.auth import OAuthToken
+
+    store = _get_token_store()
+    adapter = TokenStorageAdapter(async_key_value=store, server_url=url.rstrip("/"))
+
+    async def _refresh():
+        tokens = await adapter.get_tokens()
+        client_info = await adapter.get_client_info()
+        if not tokens or not tokens.refresh_token or not client_info:
+            return False
+
+        # Find the token endpoint from OAuth server metadata
+        # Try the well-known endpoint on the authorization server
+        resp = httpx.get(f"{url.rstrip('/')}/.well-known/oauth-protected-resource", timeout=10)
+        if resp.status_code != 200:
+            return False
+        prm = resp.json()
+        auth_server = (prm.get("authorization_servers") or [None])[0]
+        if not auth_server:
+            return False
+
+        asm_resp = httpx.get(f"{auth_server}/.well-known/oauth-authorization-server", timeout=10)
+        if asm_resp.status_code != 200:
+            return False
+        asm = asm_resp.json()
+        token_endpoint = asm.get("token_endpoint")
+        if not token_endpoint:
+            return False
+
+        # Do the refresh
+        refresh_resp = httpx.post(token_endpoint, data={
+            "grant_type": "refresh_token",
+            "refresh_token": tokens.refresh_token,
+            "client_id": client_info.client_id,
+        }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
+
+        if refresh_resp.status_code != 200:
+            print(f"[pii-proxy] Token refresh failed: {refresh_resp.status_code}", file=sys.stderr)
+            return False
+
+        new_tokens = OAuthToken.model_validate_json(refresh_resp.content)
+        await adapter.set_tokens(new_tokens)
+        print(f"[pii-proxy] Token refreshed for {url}", file=sys.stderr)
+        return True
+
+    try:
+        return asyncio.run(_refresh())
+    except Exception:
+        return False
+
+
 def _do_oauth_flow(
     url: str,
     client_id: str | None = None,

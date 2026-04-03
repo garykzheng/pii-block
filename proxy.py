@@ -113,12 +113,16 @@ def main() -> None:
         backend_url = cli["backend_url"] or os.environ.get("BACKEND_URL")
         auth = cli["auth"] or os.environ.get("BACKEND_AUTH")
         if auth == "oauth" and backend_url:
-            from core import _has_saved_tokens, _do_oauth_flow
+            from core import _has_saved_tokens, _do_oauth_flow, _refresh_saved_token
             if not _has_saved_tokens(backend_url):
                 client_id = cli["oauth_client_id"] or os.environ.get("OAUTH_CLIENT_ID")
                 port_str = cli["oauth_callback_port"] or os.environ.get("OAUTH_CALLBACK_PORT")
                 port = int(port_str) if port_str else None
                 _do_oauth_flow(backend_url, client_id=client_id, callback_port=port)
+            else:
+                # Preemptively refresh — short-lived tokens expire before
+                # the SDK's internal refresh triggers.
+                _refresh_saved_token(backend_url)
         return
 
     # ── CLI arguments (override env vars) ─────────────────────────────
@@ -140,10 +144,13 @@ def main() -> None:
     # so the event loop stays clean for the MCP server. Subsequent
     # starts find saved tokens and skip this instantly.
     if auth == "oauth" and backend_url:
-        from core import _has_saved_tokens
+        from core import _has_saved_tokens, _refresh_saved_token
         if not _has_saved_tokens(backend_url):
             ensure_cmd = [sys.executable, __file__, "--ensure-auth"] + sys.argv[1:]
             subprocess.run(ensure_cmd, check=True)
+        else:
+            # Preemptively refresh short-lived tokens so the proxy starts fresh
+            _refresh_saved_token(backend_url)
 
     fpe_key = os.environ.get(
         "FPE_KEY",

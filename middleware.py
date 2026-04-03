@@ -335,8 +335,19 @@ class PrivacyMiddleware(Middleware):
         # Handle CallToolResult (the actual type returned by FastMCP proxies)
         if hasattr(result, "content") and isinstance(result.content, list):
             masked = [self._mask_content_item(item) for item in result.content]
-            if hasattr(result, "model_copy"):
-                return result.model_copy(update={"content": masked})
+            try:
+                result.content[:] = masked
+            except (TypeError, AttributeError):
+                if hasattr(result, "model_copy"):
+                    result = result.model_copy(update={"content": masked})
+            # Also mask structured_content
+            sc = getattr(result, "structured_content", None)
+            if sc is not None:
+                masked_sc, _, _ = self._mask_json_tree(sc)
+                try:
+                    result.structured_content = masked_sc
+                except (TypeError, AttributeError):
+                    pass
             return result
 
         if isinstance(result, str):
@@ -357,8 +368,27 @@ class PrivacyMiddleware(Middleware):
             masked_content, types, count = self._mask_content_list_with_stats(
                 result.content
             )
-            if count > 0 and hasattr(result, "model_copy"):
-                result = result.model_copy(update={"content": masked_content})
+            if count > 0:
+                # Mutate in place: FastMCP may serialize the original object
+                # rather than the middleware's return value.
+                try:
+                    result.content[:] = masked_content
+                except (TypeError, AttributeError):
+                    if hasattr(result, "model_copy"):
+                        result = result.model_copy(update={"content": masked_content})
+
+            # Also mask structured_content — MCP clients may read this
+            # instead of the text content field.
+            sc = getattr(result, "structured_content", None)
+            if sc is not None:
+                masked_sc, sc_types, sc_count = self._mask_json_tree(sc)
+                types = list(dict.fromkeys(types + sc_types))
+                count += sc_count
+                try:
+                    result.structured_content = masked_sc
+                except (TypeError, AttributeError):
+                    pass
+
             return result, types, count
 
         all_types: list[str] = []

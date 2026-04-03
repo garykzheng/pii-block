@@ -288,3 +288,127 @@ class TestSurrogateNotice:
         assert "456-78-9012" not in result[0]
         assert hasattr(result[-1], "text")
         assert "privacy surrogates" in result[-1].text
+
+
+class FakeToolResult:
+    """Simulates a FastMCP ToolResult with content and structured_content."""
+    def __init__(self, content, structured_content=None):
+        self.content = content
+        self.structured_content = structured_content
+
+    def model_copy(self, update=None):
+        new = FakeToolResult(
+            content=update.get("content", self.content) if update else self.content,
+            structured_content=update.get("structured_content", self.structured_content) if update else self.structured_content,
+        )
+        return new
+
+
+class TestStructuredContentMasking:
+    """Ensure PII is masked in structured_content, not just text content."""
+
+    def setup_method(self):
+        self.store = MappingStore()
+        self.mw = PrivacyMiddleware(
+            policy=make_policy(),
+            mapping_store=self.store,
+            fpe_key=TEST_KEY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_masks_pii_in_structured_content(self):
+        """structured_content with PII should be masked — this is the field
+        that MCP clients like Claude Code read instead of text content."""
+        from mcp.types import TextContent
+        context = FakeContext(FakeMessage("get_issue", {"id": "1"}))
+
+        async def call_next(ctx):
+            return FakeToolResult(
+                content=[TextContent(type="text", text='{"name": "John Smith", "email": "john@example.com"}')],
+                structured_content={
+                    "name": "John Smith",
+                    "email": "john@example.com",
+                    "role": "engineer",
+                },
+            )
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        # Text content should be masked
+        assert "John Smith" not in result.content[0].text
+
+        # structured_content MUST also be masked
+        assert result.structured_content is not None
+        assert result.structured_content["name"] != "John Smith"
+        assert result.structured_content["email"] != "john@example.com"
+        # Non-PII fields should be unchanged
+        assert result.structured_content["role"] == "engineer"
+
+    @pytest.mark.asyncio
+    async def test_structured_content_none_passthrough(self):
+        """When structured_content is None, no error should occur."""
+        from mcp.types import TextContent
+        context = FakeContext(FakeMessage("get_item", {}))
+
+        async def call_next(ctx):
+            return FakeToolResult(
+                content=[TextContent(type="text", text="No PII here")],
+                structured_content=None,
+            )
+
+        result = await self.mw.on_call_tool(context, call_next)
+        assert result.content[0].text == "No PII here"
+        assert result.structured_content is None
+
+    @pytest.mark.asyncio
+    async def test_structured_content_nested_pii(self):
+        """PII in nested structured_content objects should be masked."""
+        from mcp.types import TextContent
+        context = FakeContext(FakeMessage("get_issue", {}))
+
+        async def call_next(ctx):
+            return FakeToolResult(
+                content=[TextContent(type="text", text="ticket data")],
+                structured_content={
+                    "assignee": {
+                        "name": "Jane Doe",
+                        "email": "jane.doe@company.com",
+                    },
+                    "requester": {
+                        "name": "Bob Wilson",
+                        "email": "bob@client.org",
+                    },
+                    "title": "Bug report",
+                },
+            )
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        sc = result.structured_content
+        assert sc["assignee"]["name"] != "Jane Doe"
+        assert sc["assignee"]["email"] != "jane.doe@company.com"
+        assert sc["requester"]["name"] != "Bob Wilson"
+        assert sc["requester"]["email"] != "bob@client.org"
+        assert sc["title"] == "Bug report"
+
+    @pytest.mark.asyncio
+    async def test_structured_content_deterministic(self):
+        """Same PII in structured_content and text content should produce same surrogates."""
+        from mcp.types import TextContent
+        context = FakeContext(FakeMessage("get_issue", {}))
+
+        async def call_next(ctx):
+            return FakeToolResult(
+                content=[TextContent(type="text", text="Contact: John Smith john@example.com")],
+                structured_content={
+                    "name": "John Smith",
+                    "email": "john@example.com",
+                },
+            )
+
+        result = await self.mw.on_call_tool(context, call_next)
+
+        # The surrogate name in structured_content should match text content
+        sc_name = result.structured_content["name"]
+        assert sc_name != "John Smith"
+        assert sc_name in result.content[0].text

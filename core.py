@@ -163,9 +163,9 @@ def build_proxy(
     - PrivacyMiddleware attached (applies to all mounted children)
     - Each enabled server from the registry mounted under its name
 
-    For OAuth backends without saved tokens, the browser-based OAuth flow
-    runs automatically during startup. Once tokens are saved, subsequent
-    starts skip the auth flow.
+    OAuth tokens should be obtained before calling this function (see
+    ``proxy.py``'s ``_ensure_auth``). The proxy connects to backends
+    using saved tokens.
     """
     parent = FastMCP("MCP Privacy Proxy")
 
@@ -181,10 +181,6 @@ def build_proxy(
     # Mount each enabled server
     enabled = registry.enabled_servers()
     for name, entry in enabled.items():
-        # OAuth backends without saved tokens: do the browser flow now
-        if entry.auth == "oauth" and not _has_saved_tokens(entry.target):
-            _do_oauth_flow(entry.target)
-
         transport = _parse_target(
             entry.target, auth=entry.auth, headers=entry.headers,
         )

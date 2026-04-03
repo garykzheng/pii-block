@@ -84,7 +84,29 @@ def _parse_cli_args() -> tuple[str | None, str | None, str | None]:
     return backend_url, backend_command, auth
 
 
+def _ensure_auth(backend_url: str) -> None:
+    """Ensure OAuth tokens exist for the backend, running the browser flow if needed.
+
+    Called as a separate step before the proxy starts so that the OAuth
+    browser flow (which can take minutes) doesn't block the MCP stdio
+    server from responding to Claude Code's initialize message.
+    """
+    from core import _has_saved_tokens, _do_oauth_flow
+    if not _has_saved_tokens(backend_url):
+        _do_oauth_flow(backend_url)
+
+
 def main() -> None:
+    # ── --ensure-auth mode: just do OAuth and exit ────────────────────
+    if "--ensure-auth" in sys.argv:
+        sys.argv.remove("--ensure-auth")
+        cli_url, cli_command, cli_auth = _parse_cli_args()
+        backend_url = cli_url or os.environ.get("BACKEND_URL")
+        auth = cli_auth or os.environ.get("BACKEND_AUTH")
+        if auth == "oauth" and backend_url:
+            _ensure_auth(backend_url)
+        return
+
     # ── CLI arguments (override env vars) ─────────────────────────────
     cli_url, cli_command, cli_auth = _parse_cli_args()
 

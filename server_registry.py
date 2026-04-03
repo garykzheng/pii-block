@@ -22,6 +22,8 @@ class ServerEntry:
     added_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     auth: str | None = None  # "oauth" or a bearer token string
     headers: dict[str, str] | None = None  # custom headers (e.g. API keys)
+    oauth_client_id: str | None = None  # pre-registered OAuth client ID
+    oauth_callback_port: int | None = None  # fixed OAuth callback port
 
 
 class ServerRegistry:
@@ -40,11 +42,14 @@ class ServerRegistry:
         name: str = "default",
         auth: str | None = None,
         headers: dict[str, str] | None = None,
+        oauth_client_id: str | None = None,
+        oauth_callback_port: int | None = None,
     ) -> ServerRegistry:
         """Create a registry with a single server (backwards compat with env vars)."""
         registry = cls()
         registry._servers[name] = ServerEntry(
             target=target, auth=auth, headers=headers,
+            oauth_client_id=oauth_client_id, oauth_callback_port=oauth_callback_port,
         )
         return registry
 

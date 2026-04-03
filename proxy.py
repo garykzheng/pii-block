@@ -7,6 +7,7 @@ CLI usage (pass-through mode for .mcp.json integration):
     python proxy.py -- npx @playwright/mcp@latest --config config.json
     python proxy.py --backend-url http://localhost:3456/mcp
     python proxy.py --auth oauth --backend-url https://mcp.slack.com/mcp
+    python proxy.py --auth oauth --oauth-client-id CLIENT_ID --backend-url https://mcp.slack.com/mcp
 
 Environment variables (optional overrides):
     BACKEND_URL        — URL of the backend MCP server (SSE/HTTP)
@@ -26,10 +27,16 @@ Environment variables (optional overrides):
           "command": "python",
           "args": ["proxy.py", "--", "npx", "@playwright/mcp@latest"]
         },
+        "pylon": {
+          "type": "stdio",
+          "command": "python",
+          "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.usepylon.com/"]
+        },
         "slack": {
           "type": "stdio",
           "command": "python",
-          "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.slack.com/mcp"]
+          "args": ["proxy.py", "--auth", "oauth", "--oauth-client-id", "CLIENT_ID",
+                   "--oauth-callback-port", "3118", "--backend-url", "https://mcp.slack.com/mcp"]
         }
       }
     }
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,16 +57,20 @@ from server_registry import ServerRegistry
 from core import build_proxy
 
 
-def _parse_cli_args() -> tuple[str | None, str | None, str | None]:
-    """Parse CLI arguments for --backend-url, --auth, and -- pass-through command.
+def _parse_cli_args() -> dict:
+    """Parse CLI arguments.
 
-    Returns (backend_url, backend_command, auth) from CLI args, or (None, None, None)
-    if no CLI args were provided.
+    Returns a dict with keys: backend_url, backend_command, auth,
+    oauth_client_id, oauth_callback_port.
     """
     argv = sys.argv[1:]
-    backend_url = None
-    backend_command = None
-    auth = None
+    result = {
+        "backend_url": None,
+        "backend_command": None,
+        "auth": None,
+        "oauth_client_id": None,
+        "oauth_callback_port": None,
+    }
 
     # Check for -- pass-through: everything after -- is the backend command
     if "--" in argv:
@@ -66,55 +78,61 @@ def _parse_cli_args() -> tuple[str | None, str | None, str | None]:
         remaining = argv[idx + 1:]
         prefix = argv[:idx]
         if remaining:
-            backend_command = " ".join(shlex.quote(a) for a in remaining)
+            result["backend_command"] = " ".join(shlex.quote(a) for a in remaining)
         argv = prefix
 
-    # Check for --backend-url and --auth
+    _FLAG_MAP = {
+        "--backend-url": "backend_url",
+        "--auth": "auth",
+        "--oauth-client-id": "oauth_client_id",
+        "--oauth-callback-port": "oauth_callback_port",
+    }
+
     i = 0
     while i < len(argv):
-        if argv[i] == "--backend-url" and i + 1 < len(argv):
-            backend_url = argv[i + 1]
-            i += 2
-        elif argv[i] == "--auth" and i + 1 < len(argv):
-            auth = argv[i + 1]
+        key = _FLAG_MAP.get(argv[i])
+        if key and i + 1 < len(argv):
+            result[key] = argv[i + 1]
             i += 2
         else:
             i += 1
 
-    return backend_url, backend_command, auth
-
-
-def _ensure_auth(backend_url: str) -> None:
-    """Ensure OAuth tokens exist for the backend, running the browser flow if needed.
-
-    Called as a separate step before the proxy starts so that the OAuth
-    browser flow (which can take minutes) doesn't block the MCP stdio
-    server from responding to Claude Code's initialize message.
-    """
-    from core import _has_saved_tokens, _do_oauth_flow
-    if not _has_saved_tokens(backend_url):
-        _do_oauth_flow(backend_url)
+    return result
 
 
 def main() -> None:
     # ── --ensure-auth mode: just do OAuth and exit ────────────────────
+    # Used internally as a subprocess to avoid event loop conflicts.
     if "--ensure-auth" in sys.argv:
         sys.argv.remove("--ensure-auth")
-        cli_url, cli_command, cli_auth = _parse_cli_args()
-        backend_url = cli_url or os.environ.get("BACKEND_URL")
-        auth = cli_auth or os.environ.get("BACKEND_AUTH")
+        cli = _parse_cli_args()
+        backend_url = cli["backend_url"] or os.environ.get("BACKEND_URL")
+        auth = cli["auth"] or os.environ.get("BACKEND_AUTH")
         if auth == "oauth" and backend_url:
-            _ensure_auth(backend_url)
+            from core import _has_saved_tokens, _do_oauth_flow
+            if not _has_saved_tokens(backend_url):
+                port = int(cli["oauth_callback_port"]) if cli["oauth_callback_port"] else None
+                _do_oauth_flow(backend_url, client_id=cli["oauth_client_id"], callback_port=port)
         return
 
     # ── CLI arguments (override env vars) ─────────────────────────────
-    cli_url, cli_command, cli_auth = _parse_cli_args()
+    cli = _parse_cli_args()
 
     # ── Resolve configuration ─────────────────────────────────────────
-    backend_url = cli_url or os.environ.get("BACKEND_URL")
-    backend_command = cli_command or os.environ.get("BACKEND_COMMAND")
-    auth = cli_auth or os.environ.get("BACKEND_AUTH")
+    backend_url = cli["backend_url"] or os.environ.get("BACKEND_URL")
+    backend_command = cli["backend_command"] or os.environ.get("BACKEND_COMMAND")
+    auth = cli["auth"] or os.environ.get("BACKEND_AUTH")
     servers_path = os.environ.get("SERVERS_PATH", "servers.yaml")
+
+    # ── Ensure OAuth tokens (runs in a subprocess) ────────────────────
+    # On first use, this opens a browser for auth. Runs as a subprocess
+    # so the event loop stays clean for the MCP server. Subsequent
+    # starts find saved tokens and skip this instantly.
+    if auth == "oauth" and backend_url:
+        from core import _has_saved_tokens
+        if not _has_saved_tokens(backend_url):
+            ensure_cmd = [sys.executable, __file__, "--ensure-auth"] + sys.argv[1:]
+            subprocess.run(ensure_cmd, check=True)
 
     fpe_key = os.environ.get(
         "FPE_KEY",
@@ -143,7 +161,12 @@ def main() -> None:
     # ── Build server registry ─────────────────────────────────────────
     # CLI args take priority, then servers.yaml, then env vars
     if backend_url:
-        registry = ServerRegistry.from_single(backend_url, auth=auth)
+        port = int(cli["oauth_callback_port"]) if cli["oauth_callback_port"] else None
+        registry = ServerRegistry.from_single(
+            backend_url, auth=auth,
+            oauth_client_id=cli["oauth_client_id"],
+            oauth_callback_port=port,
+        )
     elif backend_command:
         registry = ServerRegistry.from_single(backend_command)
     elif Path(servers_path).exists():

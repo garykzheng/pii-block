@@ -63,13 +63,26 @@ def _has_saved_tokens(url: str) -> bool:
         return asyncio.run(adapter.get_tokens()) is not None
 
 
-def _build_oauth(url: str):
+def _build_oauth(
+    url: str,
+    client_id: str | None = None,
+    callback_port: int | None = None,
+):
     """Build an OAuth instance with persistent file-based token storage."""
     from fastmcp.client.auth.oauth import OAuth
-    return OAuth(mcp_url=url, token_storage=_get_token_store())
+    kwargs: dict = {"mcp_url": url, "token_storage": _get_token_store()}
+    if client_id:
+        kwargs["client_id"] = client_id
+    if callback_port:
+        kwargs["callback_port"] = callback_port
+    return OAuth(**kwargs)
 
 
-def _do_oauth_flow(url: str) -> None:
+def _do_oauth_flow(
+    url: str,
+    client_id: str | None = None,
+    callback_port: int | None = None,
+) -> None:
     """Run the OAuth browser flow synchronously and save tokens to disk.
 
     Opens a browser for authorization, waits for the callback, exchanges
@@ -83,7 +96,7 @@ def _do_oauth_flow(url: str) -> None:
     print(f"[pii-proxy] No saved OAuth tokens for {url}", file=sys.stderr)
     print(f"[pii-proxy] Opening browser for authentication...", file=sys.stderr)
 
-    oauth = _build_oauth(url)
+    oauth = _build_oauth(url, client_id=client_id, callback_port=callback_port)
     transport = StreamableHttpTransport(url=url, auth=oauth)
 
     async def _auth():
@@ -99,6 +112,8 @@ def _parse_target(
     target: str,
     auth: str | None = None,
     headers: dict[str, str] | None = None,
+    oauth_client_id: str | None = None,
+    oauth_callback_port: int | None = None,
 ):
     """Convert a target string into a transport that FastMCP understands.
 
@@ -113,7 +128,9 @@ def _parse_target(
         from fastmcp.client.transports import StreamableHttpTransport
         kwargs: dict = {"url": target}
         if auth == "oauth":
-            kwargs["auth"] = _build_oauth(target)
+            kwargs["auth"] = _build_oauth(
+                target, client_id=oauth_client_id, callback_port=oauth_callback_port,
+            )
         elif auth is not None:
             kwargs["auth"] = auth
         if headers is not None:
@@ -183,6 +200,8 @@ def build_proxy(
     for name, entry in enabled.items():
         transport = _parse_target(
             entry.target, auth=entry.auth, headers=entry.headers,
+            oauth_client_id=entry.oauth_client_id,
+            oauth_callback_port=entry.oauth_callback_port,
         )
         child = create_proxy(transport)
 

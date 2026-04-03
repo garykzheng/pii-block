@@ -7,17 +7,18 @@ CLI usage (pass-through mode for .mcp.json integration):
     python proxy.py -- npx @playwright/mcp@latest --config config.json
     python proxy.py --backend-url http://localhost:3456/mcp
     python proxy.py --auth oauth --backend-url https://mcp.slack.com/mcp
-    python proxy.py --auth oauth --oauth-client-id CLIENT_ID --backend-url https://mcp.slack.com/mcp
 
 Environment variables (optional overrides):
-    BACKEND_URL        — URL of the backend MCP server (SSE/HTTP)
-    BACKEND_COMMAND    — Command to spawn a stdio backend (e.g. "python server.py")
-    BACKEND_AUTH       — Auth mode: "oauth" for browser-based OAuth, or a bearer token
-    FPE_KEY            — Hex-encoded 128/192/256-bit key for format-preserving encryption
-    MAPPING_STORE_PATH — Path to JSON file for persisting PII mappings
-                         (default: ~/Library/Application Support/mcp-privacy-proxy/mappings.json)
-    CONFIG_PATH        — Path to policy YAML file (default: default_policy.yaml)
-    SERVERS_PATH       — Path to servers.yaml (default: servers.yaml)
+    BACKEND_URL          — URL of the backend MCP server (SSE/HTTP)
+    BACKEND_COMMAND      — Command to spawn a stdio backend (e.g. "python server.py")
+    BACKEND_AUTH         — Auth mode: "oauth" for browser-based OAuth, or a bearer token
+    OAUTH_CLIENT_ID      — Pre-registered OAuth client ID (for servers without dynamic registration)
+    OAUTH_CALLBACK_PORT  — Fixed port for the OAuth callback server
+    FPE_KEY              — Hex-encoded 128/192/256-bit key for format-preserving encryption
+    MAPPING_STORE_PATH   — Path to JSON file for persisting PII mappings
+                           (default: ~/Library/Application Support/mcp-privacy-proxy/mappings.json)
+    CONFIG_PATH          — Path to policy YAML file (default: default_policy.yaml)
+    SERVERS_PATH         — Path to servers.yaml (default: servers.yaml)
 
 .mcp.json example:
     {
@@ -35,8 +36,11 @@ Environment variables (optional overrides):
         "slack": {
           "type": "stdio",
           "command": "python",
-          "args": ["proxy.py", "--auth", "oauth", "--oauth-client-id", "CLIENT_ID",
-                   "--oauth-callback-port", "3118", "--backend-url", "https://mcp.slack.com/mcp"]
+          "args": ["proxy.py", "--auth", "oauth", "--backend-url", "https://mcp.slack.com/mcp"],
+          "env": {
+            "OAUTH_CLIENT_ID": "your-workspace-client-id",
+            "OAUTH_CALLBACK_PORT": "3118"
+          }
         }
       }
     }
@@ -111,8 +115,10 @@ def main() -> None:
         if auth == "oauth" and backend_url:
             from core import _has_saved_tokens, _do_oauth_flow
             if not _has_saved_tokens(backend_url):
-                port = int(cli["oauth_callback_port"]) if cli["oauth_callback_port"] else None
-                _do_oauth_flow(backend_url, client_id=cli["oauth_client_id"], callback_port=port)
+                client_id = cli["oauth_client_id"] or os.environ.get("OAUTH_CLIENT_ID")
+                port_str = cli["oauth_callback_port"] or os.environ.get("OAUTH_CALLBACK_PORT")
+                port = int(port_str) if port_str else None
+                _do_oauth_flow(backend_url, client_id=client_id, callback_port=port)
         return
 
     # ── CLI arguments (override env vars) ─────────────────────────────
@@ -123,6 +129,11 @@ def main() -> None:
     backend_command = cli["backend_command"] or os.environ.get("BACKEND_COMMAND")
     auth = cli["auth"] or os.environ.get("BACKEND_AUTH")
     servers_path = os.environ.get("SERVERS_PATH", "servers.yaml")
+
+    # ── OAuth config from env vars ──────────────────────────────────────
+    oauth_client_id = cli["oauth_client_id"] or os.environ.get("OAUTH_CLIENT_ID")
+    oauth_callback_port_str = cli["oauth_callback_port"] or os.environ.get("OAUTH_CALLBACK_PORT")
+    oauth_callback_port = int(oauth_callback_port_str) if oauth_callback_port_str else None
 
     # ── Ensure OAuth tokens (runs in a subprocess) ────────────────────
     # On first use, this opens a browser for auth. Runs as a subprocess
@@ -161,11 +172,10 @@ def main() -> None:
     # ── Build server registry ─────────────────────────────────────────
     # CLI args take priority, then servers.yaml, then env vars
     if backend_url:
-        port = int(cli["oauth_callback_port"]) if cli["oauth_callback_port"] else None
         registry = ServerRegistry.from_single(
             backend_url, auth=auth,
-            oauth_client_id=cli["oauth_client_id"],
-            oauth_callback_port=port,
+            oauth_client_id=oauth_client_id,
+            oauth_callback_port=oauth_callback_port,
         )
     elif backend_command:
         registry = ServerRegistry.from_single(backend_command)

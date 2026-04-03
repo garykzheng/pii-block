@@ -75,7 +75,19 @@ def _build_oauth(
         kwargs["client_id"] = client_id
     if callback_port:
         kwargs["callback_port"] = callback_port
-    return OAuth(**kwargs)
+    # Request token_endpoint_auth_method "none" so servers that default
+    # to client_secret_basic (e.g. Pylon/WorkOS) don't generate a secret
+    # that then fails at token exchange.
+    kwargs["additional_client_metadata"] = {
+        "token_endpoint_auth_method": "none",
+    }
+    oauth = OAuth(**kwargs)
+    # Workaround: some servers reject the RFC 8707 `resource` parameter
+    # in the token exchange request. Patch the context so the SDK never
+    # includes it.
+    if hasattr(oauth, "context"):
+        oauth.context.should_include_resource_param = lambda *_a: False
+    return oauth
 
 
 def _do_oauth_flow(

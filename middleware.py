@@ -630,11 +630,19 @@ class PrivacyMiddleware(Middleware):
             # Case-insensitive search and replace
             idx = text.lower().find(real_val.lower())
             while idx != -1:
+                end = idx + len(real_val)
                 # Don't replace inside JSON keys
-                if json_key_spans and _overlaps_any_span(idx, idx + len(real_val), json_key_spans):
-                    idx = text.lower().find(real_val.lower(), idx + len(real_val))
+                if json_key_spans and _overlaps_any_span(idx, end, json_key_spans):
+                    idx = text.lower().find(real_val.lower(), end)
                     continue
-                text = text[:idx] + surrogate + text[idx + len(real_val):]
+                # Word boundary check: the match must not be embedded
+                # inside a larger word (e.g. "wright" inside "playwright").
+                char_before = text[idx - 1] if idx > 0 else " "
+                char_after = text[end] if end < len(text) else " "
+                if char_before.isalnum() or char_after.isalnum():
+                    idx = text.lower().find(real_val.lower(), end)
+                    continue
+                text = text[:idx] + surrogate + text[end:]
                 count += 1
                 # Recompute key spans since offsets shifted
                 if json_key_spans:
@@ -802,12 +810,28 @@ class PrivacyMiddleware(Middleware):
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
 
+        # NER-based entity types need higher confidence thresholds
+        # because the spaCy model frequently tags common English words
+        # as entities at low–medium confidence (e.g. "disconnect" → PERSON).
+        # Pattern-based entities (PHONE, SSN, CC, EMAIL) are regex-matched
+        # and reliable at any score.
+        _NER_SCORE_THRESHOLDS = {
+            "PERSON": 0.85,
+            "LOCATION": 0.7,
+            "ORGANIZATION": 0.7,
+        }
+
         filtered = []
         for r in results:
             value = text[r.start:r.end]
 
             # Skip entities that fall inside JSON keys
             if json_key_spans and _overlaps_any_span(r.start, r.end, json_key_spans):
+                continue
+
+            # Enforce higher score thresholds for NER-based entities
+            min_score = _NER_SCORE_THRESHOLDS.get(r.entity_type)
+            if min_score and r.score < min_score:
                 continue
 
             if r.entity_type == "PERSON":

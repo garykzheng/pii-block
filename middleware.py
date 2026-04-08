@@ -31,6 +31,25 @@ from operators import (
 logger = logging.getLogger("privacy_middleware")
 
 
+def _find_url_spans(text: str) -> list[tuple[int, int]]:
+    """Find character spans of URLs in text.
+
+    Matches http(s) URLs and common bare-domain patterns (e.g. foo.com/bar).
+    Used to prevent PII masking from corrupting URLs.
+    """
+    spans: list[tuple[int, int]] = []
+    # Full URLs: http(s)://...
+    for m in re.finditer(r'https?://[^\s<>"\')\]]+', text):
+        spans.append((m.start(), m.end()))
+    # Bare domains: word.tld or word.tld/path (common TLDs only)
+    for m in re.finditer(
+        r'(?<![@\w])[\w.-]+\.(?:com|org|net|io|app|ai|dev|co|sh|xyz|site|cloud)(?:/[^\s<>"\')\]]*)?',
+        text,
+    ):
+        spans.append((m.start(), m.end()))
+    return spans
+
+
 def _find_json_key_spans(text: str) -> list[tuple[int, int]]:
     """Find character spans of JSON object keys in serialized JSON text.
 
@@ -608,23 +627,32 @@ class PrivacyMiddleware(Middleware):
         # Collect all (real_value, surrogate) pairs across entity types,
         # excluding very short values (< 4 chars) to avoid false matches
         # on common words embedded in longer text.
-        # Also skip any values on the policy allow list.
+        # Also skip any values on the policy allow list, and any values
+        # that *contain* an allow-listed term (catches cascading garbage
+        # like "Rebecca Paycom" when "Paycom" is allow-listed).
         allow_set = {v.lower() for v in self.policy.allow_list}
         pairs: list[tuple[str, str]] = []
         for _etype, mappings in forward.items():
             for real_val, surrogate in mappings.items():
-                if len(real_val) >= 4 and real_val.lower() not in allow_set:
-                    pairs.append((real_val, surrogate))
+                if len(real_val) < 4:
+                    continue
+                rv_lower = real_val.lower()
+                if rv_lower in allow_set:
+                    continue
+                if any(term in rv_lower for term in allow_set if len(term) >= 4):
+                    continue
+                pairs.append((real_val, surrogate))
 
         # Sort by length descending — replace longer values first
         pairs.sort(key=lambda p: len(p[0]), reverse=True)
 
-        # Pre-compute JSON key spans so we never replace inside keys
+        # Pre-compute spans to protect from replacement
         try:
             json.loads(text)
             json_key_spans = _find_json_key_spans(text)
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
+        url_spans = _find_url_spans(text)
 
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
@@ -633,6 +661,10 @@ class PrivacyMiddleware(Middleware):
                 end = idx + len(real_val)
                 # Don't replace inside JSON keys
                 if json_key_spans and _overlaps_any_span(idx, end, json_key_spans):
+                    idx = text.lower().find(real_val.lower(), end)
+                    continue
+                # Don't replace inside URLs
+                if url_spans and _overlaps_any_span(idx, end, url_spans):
                     idx = text.lower().find(real_val.lower(), end)
                     continue
                 # Word boundary check: the match must not be embedded
@@ -733,7 +765,10 @@ class PrivacyMiddleware(Middleware):
 
         # Build allow list: policy allow_list terms + known surrogates
         # so Presidio skips both user-protected terms and already-masked values
-        allow_list = list(self.policy.allow_list) + list(self.mapping_store.all_surrogates())
+        # Build allow list with both original and lowercase forms,
+        # since Presidio's allow_list matching is case-sensitive.
+        raw_allow = list(self.policy.allow_list) + list(self.mapping_store.all_surrogates())
+        allow_list = list({v for term in raw_allow for v in (term, term.lower())})
         allow_list = allow_list or None
 
         # If the text looks like HTML, extract plain text for analysis
@@ -803,12 +838,13 @@ class PrivacyMiddleware(Middleware):
         - PERSON entities that look like URLs
         - PERSON entities that are common short words (1-2 chars)
         """
-        # Pre-compute JSON key spans so we can skip detections inside keys
+        # Pre-compute protected spans
         try:
             json.loads(text)
             json_key_spans = _find_json_key_spans(text)
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
+        url_spans = _find_url_spans(text)
 
         # NER-based entity types need higher confidence thresholds
         # because the spaCy model frequently tags common English words
@@ -827,6 +863,10 @@ class PrivacyMiddleware(Middleware):
 
             # Skip entities that fall inside JSON keys
             if json_key_spans and _overlaps_any_span(r.start, r.end, json_key_spans):
+                continue
+
+            # Skip entities inside URLs
+            if url_spans and _overlaps_any_span(r.start, r.end, url_spans):
                 continue
 
             # Enforce higher score thresholds for NER-based entities

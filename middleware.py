@@ -558,6 +558,14 @@ class PrivacyMiddleware(Middleware):
                     field_path = f"{path}.{key}" if path else key
                     entity = self.policy.match_field(field_path)
                     if entity and isinstance(value, str) and value.strip():
+                        # For generic field patterns like *.name, validate
+                        # that the value actually looks like the expected
+                        # entity type before masking. Specific fields like
+                        # *.first_name are trusted without validation.
+                        if key == "name" and entity == "PERSON":
+                            if not self._looks_like_person_name(value):
+                                new_obj[key] = walk(value, field_path)
+                                continue
                         masked = self._mask_field_value(value, entity)
                         if masked != value:
                             count += 1
@@ -588,6 +596,59 @@ class PrivacyMiddleware(Middleware):
                 # Generate one — this creates sub-token mappings too
                 self._mask_field_value(full_name, "PERSON")
         return obj
+
+    # Characters allowed in person names (letters, spaces, hyphens,
+    # apostrophes, periods for initials, and accented unicode).
+    _NAME_CHAR_RE = re.compile(r"^[\w\s'\-.]+$", re.UNICODE)
+
+    def _looks_like_person_name(self, value: str) -> bool:
+        """Check whether a string plausibly looks like a person name.
+
+        Used to validate generic ``*.name`` field matches before blindly
+        masking them as PERSON. Accepts values that:
+          1. Are already in the mapping store (previously confirmed PII), OR
+          2. Are detected as PERSON by Presidio at any confidence, OR
+          3. Have name-like structure: 2+ Title-Case words, only letters
+             / hyphens / apostrophes / periods (no digits, slashes, etc.)
+
+        The structural check is needed because Presidio's NER misses
+        non-Anglo names like "Nando Sangenetto".
+        """
+        value = value.strip()
+        if not value or len(value) > 80:
+            return False
+
+        # Already known PII
+        if self.mapping_store.get_surrogate("PERSON", value) is not None:
+            return True
+
+        # Ask Presidio (any confidence)
+        try:
+            results = self.analyzer.analyze(
+                text=value, language="en",
+                entities=["PERSON"], score_threshold=0.0,
+            )
+            if results:
+                return True
+        except Exception:
+            pass
+
+        # Structural check: 2+ words, each starts with a capital letter,
+        # only allowed name characters (no digits/symbols).
+        if not self._NAME_CHAR_RE.match(value):
+            return False
+        words = value.split()
+        if len(words) < 2:
+            return False
+        for w in words:
+            # Strip trailing period (e.g. initials like "J.")
+            stripped = w.rstrip(".")
+            if not stripped:
+                return False
+            # Each word must start with an uppercase letter
+            if not stripped[0].isupper():
+                return False
+        return True
 
     def _mask_field_value(self, value: str, entity_type: str) -> str:
         """Mask a single field value using the configured operator for its entity type."""
@@ -646,13 +707,17 @@ class PrivacyMiddleware(Middleware):
         # Sort by length descending — replace longer values first
         pairs.sort(key=lambda p: len(p[0]), reverse=True)
 
-        # Pre-compute spans to protect from replacement
+        # Pre-compute spans to protect from replacement.
+        # NOTE: We deliberately do NOT skip URLs here — confirmed PII
+        # in the mapping store should be masked even inside URLs (e.g.
+        # a real name appearing in a Slack message link). URL exclusion
+        # only applies to Presidio NER detections to avoid corrupting
+        # domain names like slack.com.
         try:
             json.loads(text)
             json_key_spans = _find_json_key_spans(text)
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
-        url_spans = _find_url_spans(text)
 
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
@@ -661,10 +726,6 @@ class PrivacyMiddleware(Middleware):
                 end = idx + len(real_val)
                 # Don't replace inside JSON keys
                 if json_key_spans and _overlaps_any_span(idx, end, json_key_spans):
-                    idx = text.lower().find(real_val.lower(), end)
-                    continue
-                # Don't replace inside URLs
-                if url_spans and _overlaps_any_span(idx, end, url_spans):
                     idx = text.lower().find(real_val.lower(), end)
                     continue
                 # Word boundary check: the match must not be embedded
@@ -771,8 +832,12 @@ class PrivacyMiddleware(Middleware):
         allow_list = list({v for term in raw_allow for v in (term, term.lower())})
         allow_list = allow_list or None
 
-        # If the text looks like HTML, extract plain text for analysis
-        is_html = bool(re.search(r"<[a-zA-Z][^>]*>", text))
+        # If the text looks like HTML, extract plain text for analysis.
+        # Use a strict regex requiring a valid HTML tag name (letters/digits/
+        # hyphens) followed by whitespace, "/", or ">" — this avoids
+        # matching Slack mrkdwn like <mailto:foo@bar.com> or <https://x>
+        # whose contents would otherwise be stripped away unexamined.
+        is_html = bool(re.search(r"<\/?[a-zA-Z][a-zA-Z0-9-]*[\s/>]", text))
         if is_html:
             plain_text, offset_map = _strip_html(text)
         else:

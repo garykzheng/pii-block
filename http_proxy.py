@@ -355,8 +355,12 @@ def _resolve_policy_path() -> str:
 
 def main() -> None:
     import argparse
+    import asyncio
+
     parser = argparse.ArgumentParser(description="MCP PII-masking HTTP reverse proxy")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "9100")))
+    parser.add_argument("--base-port", type=int, default=int(os.environ.get("BASE_PORT", "9100")),
+                        help="Starting port for multi-backend mode (each backend gets its own port)")
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--backend-url", default=os.environ.get("BACKEND_URL"))
     parser.add_argument("--servers", default=os.environ.get("SERVERS_PATH", "servers.yaml"),
@@ -364,33 +368,48 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.backend_url:
+        # Single backend on one port
         app = create_app(backend_url=args.backend_url)
         print(f"PII reverse proxy listening on http://{args.host}:{args.port}")
         print(f"  Forwarding to {args.backend_url}")
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
+        # Multi-backend: each gets its own port (no prefix rewriting needed)
         servers_path = args.servers
-        if Path(servers_path).exists():
-            from server_registry import ServerRegistry
-            registry = ServerRegistry(path=servers_path)
-            backends = {
-                name: entry.target
-                for name, entry in registry.enabled_servers().items()
-            }
-            if not backends:
-                print("No enabled servers in servers.yaml", file=sys.stderr)
-                sys.exit(1)
-            app = create_app(backends=backends)
-            print(f"PII reverse proxy listening on http://{args.host}:{args.port}")
-            for name, url in backends.items():
-                print(f"  /{name} → {url}")
-        else:
-            print(
-                "Provide --backend-url or --servers path/to/servers.yaml",
-                file=sys.stderr,
-            )
+        if not Path(servers_path).exists():
+            print("Provide --backend-url or --servers path/to/servers.yaml", file=sys.stderr)
             sys.exit(1)
 
-    uvicorn.run(app, host=args.host, port=args.port)
+        from server_registry import ServerRegistry
+        registry = ServerRegistry(path=servers_path)
+        backends = {
+            name: entry.target
+            for name, entry in registry.enabled_servers().items()
+        }
+        if not backends:
+            print("No enabled servers in servers.yaml", file=sys.stderr)
+            sys.exit(1)
+
+        # Share one middleware instance across all backends
+        mw = _build_middleware(_resolve_policy_path(), str(default_mapping_path()),
+                              os.environ.get("FPE_KEY", "EF4359D8D580AA4F7F036D6F04FC6A94"))
+
+        async def run_all():
+            servers = []
+            port = args.base_port
+            print("PII reverse proxy starting...")
+            for name, url in backends.items():
+                app = create_app(backend_url=url, middleware=mw)
+                config = uvicorn.Config(app, host=args.host, port=port, log_level="warning")
+                server = uvicorn.Server(config)
+                print(f"  http://{args.host}:{port} → {url}  ({name})")
+                servers.append(server)
+                port += 1
+
+            # Run all servers concurrently
+            await asyncio.gather(*(s.serve() for s in servers))
+
+        asyncio.run(run_all())
 
 
 if __name__ == "__main__":

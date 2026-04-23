@@ -618,6 +618,11 @@ class PrivacyMiddleware(Middleware):
         if not value or len(value) > 80:
             return False
 
+        # Reject if any word in the value is on the allow list
+        allow_set = {v.lower() for v in self.policy.allow_list}
+        if any(w.lower() in allow_set for w in value.split()):
+            return False
+
         # Already known PII
         if self.mapping_store.get_surrogate("PERSON", value) is not None:
             return True
@@ -862,6 +867,16 @@ class PrivacyMiddleware(Middleware):
 
         # Filter out low-quality detections
         analyzer_results = self._filter_results(analyzer_results, plain_text)
+
+        # Drop detections whose text contains an allow-listed word.
+        # Presidio's built-in allow_list only matches exact strings, not
+        # partial words (e.g. "Data" won't block "Data Syncs").
+        if self.policy.allow_list:
+            _allow_words = {v.lower() for v in self.policy.allow_list if len(v) >= 3}
+            analyzer_results = [
+                r for r in analyzer_results
+                if not any(w in _allow_words for w in plain_text[r.start:r.end].lower().split())
+            ]
 
         if not analyzer_results:
             accumulated = prior_count + prescan_count

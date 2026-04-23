@@ -325,15 +325,26 @@ class PrivacyMiddleware(Middleware):
         if not surrogates:
             return text
 
-        # Sort by length descending to match longer surrogates first
+        # Sort by length descending to match longer surrogates first.
+        # Skip very short surrogates (< 4 chars) to avoid matching
+        # inside unrelated words (e.g. "Li" inside "application").
         for surrogate in sorted(surrogates, key=len, reverse=True):
+            if len(surrogate) < 4:
+                continue
             # Case-insensitive search
             idx = text.lower().find(surrogate.lower())
             while idx != -1:
+                end = idx + len(surrogate)
+                # Word boundary check: don't replace inside larger words
+                char_before = text[idx - 1] if idx > 0 else " "
+                char_after = text[end] if end < len(text) else " "
+                if char_before.isalnum() or char_after.isalnum():
+                    idx = text.lower().find(surrogate.lower(), end)
+                    continue
                 result = self.mapping_store.has_surrogate_anywhere(surrogate)
                 if result is not None:
                     _entity_type, real_value = result
-                    text = text[:idx] + real_value + text[idx + len(surrogate):]
+                    text = text[:idx] + real_value + text[end:]
                     # Continue searching after the replacement
                     idx = text.lower().find(surrogate.lower(), idx + len(real_value))
                 else:

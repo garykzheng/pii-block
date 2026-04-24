@@ -635,6 +635,11 @@ class PrivacyMiddleware(Middleware):
         last = obj.get("last_name", "")
         if first and last and isinstance(first, str) and isinstance(last, str):
             full_name = f"{first} {last}"
+            # Validate that this actually looks like a person name —
+            # avoids storing mappings for technical identifiers that
+            # happen to be in first_name/last_name fields.
+            if not self._looks_like_person_name(full_name):
+                return obj
             # Check if we already have a mapping
             existing = self.mapping_store.get_surrogate("PERSON", full_name)
             if existing is None:

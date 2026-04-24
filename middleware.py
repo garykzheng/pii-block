@@ -35,6 +35,10 @@ _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
+# Slack identifiers: channel (C), user (U/W), team (T), group (G),
+# DM (D), enterprise (E). 9+ alphanumerics in uppercase.
+_SLACK_ID_RE = re.compile(r"\b[CUTWGDE][A-Z0-9]{8,}\b")
+
 
 def _find_uuid_spans(text: str) -> list[tuple[int, int]]:
     """Find character spans of UUIDs in text.
@@ -44,6 +48,17 @@ def _find_uuid_spans(text: str) -> list[tuple[int, int]]:
     misdetects as LOCATION or PERSON.
     """
     return [(m.start(), m.end()) for m in _UUID_RE.finditer(text)]
+
+
+def _find_slack_id_spans(text: str) -> list[tuple[int, int]]:
+    """Find character spans of Slack IDs in text.
+
+    Slack channel/user/team/etc. IDs follow the pattern
+    ``[CUTWGDE][A-Z0-9]{8+}`` (e.g. C059079JARF, U03N32D0R4P).
+    Their first 8 characters can look name-shaped and get misdetected
+    by Presidio's NER as PERSON or LOCATION.
+    """
+    return [(m.start(), m.end()) for m in _SLACK_ID_RE.finditer(text)]
 
 
 def _find_url_spans(text: str) -> list[tuple[int, int]]:
@@ -754,6 +769,7 @@ class PrivacyMiddleware(Middleware):
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
         uuid_spans = _find_uuid_spans(text)
+        slack_id_spans = _find_slack_id_spans(text)
 
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
@@ -766,6 +782,10 @@ class PrivacyMiddleware(Middleware):
                     continue
                 # Don't replace inside UUIDs
                 if uuid_spans and _overlaps_any_span(idx, end, uuid_spans):
+                    idx = text.lower().find(real_val.lower(), end)
+                    continue
+                # Don't replace inside Slack IDs
+                if slack_id_spans and _overlaps_any_span(idx, end, slack_id_spans):
                     idx = text.lower().find(real_val.lower(), end)
                     continue
                 # Word boundary check: the match must not be embedded
@@ -968,6 +988,7 @@ class PrivacyMiddleware(Middleware):
             json_key_spans = []
         url_spans = _find_url_spans(text)
         uuid_spans = _find_uuid_spans(text)
+        slack_id_spans = _find_slack_id_spans(text)
 
         # NER-based entity types need higher confidence thresholds
         # because the spaCy model frequently tags common English words
@@ -994,6 +1015,10 @@ class PrivacyMiddleware(Middleware):
 
             # Skip entities inside UUIDs
             if uuid_spans and _overlaps_any_span(r.start, r.end, uuid_spans):
+                continue
+
+            # Skip entities inside Slack IDs
+            if slack_id_spans and _overlaps_any_span(r.start, r.end, slack_id_spans):
                 continue
 
             # Enforce higher score thresholds for NER-based entities

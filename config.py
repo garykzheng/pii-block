@@ -57,6 +57,7 @@ class PolicyConfig:
     entities: dict[str, EntityPolicy] = field(default_factory=dict)
     custom_recognizers: list[CustomRecognizer] = field(default_factory=list)
     field_rules: list[FieldRule] = field(default_factory=list)
+    never_mask_paths: list[str] = field(default_factory=list)
     allow_list: list[str] = field(default_factory=list)
     surrogate_notice: bool = True
 
@@ -75,6 +76,13 @@ class PolicyConfig:
             if fnmatch.fnmatch(field_path, rule.pattern):
                 return rule.entity
         return None
+
+    def is_path_excluded(self, field_path: str) -> bool:
+        """Return True if this path matches a never_mask_paths pattern."""
+        for pattern in self.never_mask_paths:
+            if fnmatch.fnmatch(field_path, pattern):
+                return True
+        return False
 
 
 def load_policy(path: str | Path) -> PolicyConfig:
@@ -109,12 +117,14 @@ def load_policy(path: str | Path) -> PolicyConfig:
         ))
 
     allow_list: list[str] = raw.get("allow_list", [])
+    never_mask_paths: list[str] = raw.get("never_mask_paths", [])
     surrogate_notice: bool = raw.get("surrogate_notice", True)
 
     return PolicyConfig(
         entities=entities,
         custom_recognizers=custom_recognizers,
         field_rules=field_rules,
+        never_mask_paths=never_mask_paths,
         allow_list=allow_list,
         surrogate_notice=surrogate_notice,
     )

@@ -31,6 +31,21 @@ from operators import (
 logger = logging.getLogger("privacy_middleware")
 
 
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+
+
+def _find_uuid_spans(text: str) -> list[tuple[int, int]]:
+    """Find character spans of UUIDs in text.
+
+    Used to prevent PII masking from corrupting UUIDs, which sometimes
+    contain letter sequences (e.g. "c0a4d5ea") that Presidio's NER
+    misdetects as LOCATION or PERSON.
+    """
+    return [(m.start(), m.end()) for m in _UUID_RE.finditer(text)]
+
+
 def _find_url_spans(text: str) -> list[tuple[int, int]]:
     """Find character spans of URLs in text.
 
@@ -567,6 +582,10 @@ class PrivacyMiddleware(Middleware):
                 new_obj = {}
                 for key, value in obj.items():
                     field_path = f"{path}.{key}" if path else key
+                    # Path exclusions take priority over all field rules
+                    if self.policy.is_path_excluded(field_path):
+                        new_obj[key] = value
+                        continue
                     entity = self.policy.match_field(field_path)
                     if entity and isinstance(value, str) and value.strip():
                         # For generic field patterns like *.name, validate
@@ -734,6 +753,7 @@ class PrivacyMiddleware(Middleware):
             json_key_spans = _find_json_key_spans(text)
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
+        uuid_spans = _find_uuid_spans(text)
 
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
@@ -742,6 +762,10 @@ class PrivacyMiddleware(Middleware):
                 end = idx + len(real_val)
                 # Don't replace inside JSON keys
                 if json_key_spans and _overlaps_any_span(idx, end, json_key_spans):
+                    idx = text.lower().find(real_val.lower(), end)
+                    continue
+                # Don't replace inside UUIDs
+                if uuid_spans and _overlaps_any_span(idx, end, uuid_spans):
                     idx = text.lower().find(real_val.lower(), end)
                     continue
                 # Word boundary check: the match must not be embedded
@@ -797,8 +821,11 @@ class PrivacyMiddleware(Middleware):
         # Non-JSON path: prescan + Presidio on raw text
         return self._mask_plain_text(text, field_count)
 
-    def _mask_json_tree(self, obj: Any) -> tuple[Any, list[str], int]:
+    def _mask_json_tree(self, obj: Any, path: str = "") -> tuple[Any, list[str], int]:
         """Walk a parsed JSON tree and mask each string value individually.
+
+        Tracks the JSON path so values at paths matching never_mask_paths
+        patterns can be skipped.
 
         Returns (masked_obj, entity_types, count).
         """
@@ -808,7 +835,11 @@ class PrivacyMiddleware(Middleware):
         if isinstance(obj, dict):
             new_obj = {}
             for key, value in obj.items():
-                masked_val, types, count = self._mask_json_tree(value)
+                child_path = f"{path}.{key}" if path else key
+                if self.policy.is_path_excluded(child_path):
+                    new_obj[key] = value
+                    continue
+                masked_val, types, count = self._mask_json_tree(value, child_path)
                 new_obj[key] = masked_val
                 all_types.update(types)
                 total_count += count
@@ -817,7 +848,7 @@ class PrivacyMiddleware(Middleware):
         if isinstance(obj, list):
             new_list = []
             for item in obj:
-                masked_item, types, count = self._mask_json_tree(item)
+                masked_item, types, count = self._mask_json_tree(item, path)
                 new_list.append(masked_item)
                 all_types.update(types)
                 total_count += count
@@ -936,6 +967,7 @@ class PrivacyMiddleware(Middleware):
         except (json.JSONDecodeError, ValueError):
             json_key_spans = []
         url_spans = _find_url_spans(text)
+        uuid_spans = _find_uuid_spans(text)
 
         # NER-based entity types need higher confidence thresholds
         # because the spaCy model frequently tags common English words
@@ -958,6 +990,10 @@ class PrivacyMiddleware(Middleware):
 
             # Skip entities inside URLs
             if url_spans and _overlaps_any_span(r.start, r.end, url_spans):
+                continue
+
+            # Skip entities inside UUIDs
+            if uuid_spans and _overlaps_any_span(r.start, r.end, uuid_spans):
                 continue
 
             # Enforce higher score thresholds for NER-based entities

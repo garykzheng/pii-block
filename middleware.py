@@ -1045,6 +1045,13 @@ class PrivacyMiddleware(Middleware):
                 # Skip values containing @ (emails misdetected as names)
                 if "@" in value:
                     continue
+                # Skip snake_case identifiers (created_by, job_output, etc.)
+                # Real person names virtually never contain underscores.
+                if "_" in value:
+                    continue
+                # Skip values containing digits (likely identifiers/codes)
+                if any(c.isdigit() for c in value):
+                    continue
 
             filtered.append(r)
         return filtered

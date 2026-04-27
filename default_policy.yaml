@@ -15,9 +15,43 @@ entities:
     operator: deterministic_faker
   ORGANIZATION:
     operator: deterministic_faker
+  SECRET:
+    operator: deterministic_faker
   DEFAULT:
     operator: replace
     new_value: '<REDACTED>'
+
+custom_recognizers:
+  # JSON Web Token (header.payload.signature, all base64url)
+  - entity: SECRET
+    pattern: '\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b'
+    score: 0.95
+    operator: deterministic_faker
+  # GitHub personal access tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+  - entity: SECRET
+    pattern: '\bgh[pousr]_[A-Za-z0-9]{36}\b'
+    score: 0.95
+    operator: deterministic_faker
+  # AWS access keys (AKIA + 16 alnum)
+  - entity: SECRET
+    pattern: '\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
+    score: 0.95
+    operator: deterministic_faker
+  # Stripe secret keys
+  - entity: SECRET
+    pattern: '\bsk_(?:live|test)_[A-Za-z0-9]{24,}\b'
+    score: 0.95
+    operator: deterministic_faker
+  # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-)
+  - entity: SECRET
+    pattern: '\bxox[baprs]-[A-Za-z0-9-]{10,}\b'
+    score: 0.95
+    operator: deterministic_faker
+  # OpenAI/Anthropic API keys (sk-... or sk-ant-...)
+  - entity: SECRET
+    pattern: '\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b'
+    score: 0.95
+    operator: deterministic_faker
 
 field_rules:
   - pattern: "*.first_name"
@@ -40,3 +74,32 @@ field_rules:
     entity: US_SSN
   - pattern: "*.social_security_number"
     entity: US_SSN
+  # Credentials — round-trip via mapping store
+  - pattern: "*.password"
+    entity: SECRET
+  - pattern: "*.passwd"
+    entity: SECRET
+  - pattern: "*.api_key"
+    entity: SECRET
+  - pattern: "*.api_secret"
+    entity: SECRET
+  - pattern: "*.access_token"
+    entity: SECRET
+  - pattern: "*.refresh_token"
+    entity: SECRET
+  - pattern: "*.id_token"
+    entity: SECRET
+  - pattern: "*.bearer_token"
+    entity: SECRET
+  - pattern: "*.client_secret"
+    entity: SECRET
+  - pattern: "*.private_key"
+    entity: SECRET
+  - pattern: "*.secret_key"
+    entity: SECRET
+  - pattern: "*.session_token"
+    entity: SECRET
+  - pattern: "*.auth_token"
+    entity: SECRET
+  - pattern: "*.authorization"
+    entity: SECRET

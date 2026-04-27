@@ -149,6 +149,7 @@ _FAKER_METHODS: dict[str, str] = {
     "ADDRESS": "address",
     "ORGANIZATION": "company",
     "URL": "url",
+    "SECRET": "password",
 }
 
 

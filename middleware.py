@@ -668,6 +668,17 @@ class PrivacyMiddleware(Middleware):
         if not value or len(value) > 80:
             return False
 
+        # Reject snake_case identifiers (provider_company_id, created_by,
+        # etc.). Real person names virtually never contain underscores.
+        # This must come before the Presidio check, since Presidio's NER
+        # often scores these as PERSON at 0.85 regardless.
+        if "_" in value:
+            return False
+
+        # Reject values containing digits (codes / IDs)
+        if any(c.isdigit() for c in value):
+            return False
+
         # Reject if any word in the value is on the allow list
         allow_set = {v.lower() for v in self.policy.allow_list}
         if any(w.lower() in allow_set for w in value.split()):

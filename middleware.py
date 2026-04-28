@@ -39,6 +39,12 @@ _UUID_RE = re.compile(
 # DM (D), enterprise (E). 9+ alphanumerics in uppercase.
 _SLACK_ID_RE = re.compile(r"\b[CUTWGDE][A-Z0-9]{8,}\b")
 
+# Prefix-style IDs (Stripe-shaped): org_*, usr_*, acct_*, cus_*, etc.
+# Pattern: 2-8 lowercase letter prefix, underscore, 8+ alphanumerics.
+# Body excludes underscores so this doesn't match snake_case English
+# like "provider_company_name" or "created_by".
+_PREFIX_ID_RE = re.compile(r"\b[a-z]{2,8}_[A-Za-z0-9]{8,}\b")
+
 
 def _find_uuid_spans(text: str) -> list[tuple[int, int]]:
     """Find character spans of UUIDs in text.
@@ -59,6 +65,17 @@ def _find_slack_id_spans(text: str) -> list[tuple[int, int]]:
     by Presidio's NER as PERSON or LOCATION.
     """
     return [(m.start(), m.end()) for m in _SLACK_ID_RE.finditer(text)]
+
+
+def _find_prefix_id_spans(text: str) -> list[tuple[int, int]]:
+    """Find character spans of prefix-style IDs (org_*, usr_*, cus_*, etc.).
+
+    Many APIs use Stripe-style prefixed identifiers like
+    ``org_HpE7IuGBi1xFkjHZ`` — these aren't UUIDs but should never be
+    treated as PII. Body must be 8+ chars without underscores so this
+    pattern doesn't match snake_case English (created_by, etc.).
+    """
+    return [(m.start(), m.end()) for m in _PREFIX_ID_RE.finditer(text)]
 
 
 def _find_url_spans(text: str) -> list[tuple[int, int]]:
@@ -786,6 +803,7 @@ class PrivacyMiddleware(Middleware):
             json_key_spans = []
         uuid_spans = _find_uuid_spans(text)
         slack_id_spans = _find_slack_id_spans(text)
+        prefix_id_spans = _find_prefix_id_spans(text)
 
         for real_val, surrogate in pairs:
             # Case-insensitive search and replace
@@ -802,6 +820,10 @@ class PrivacyMiddleware(Middleware):
                     continue
                 # Don't replace inside Slack IDs
                 if slack_id_spans and _overlaps_any_span(idx, end, slack_id_spans):
+                    idx = text.lower().find(real_val.lower(), end)
+                    continue
+                # Don't replace inside prefix-style IDs (org_*, usr_*, etc.)
+                if prefix_id_spans and _overlaps_any_span(idx, end, prefix_id_spans):
                     idx = text.lower().find(real_val.lower(), end)
                     continue
                 # Word boundary check: the match must not be embedded
@@ -1005,6 +1027,7 @@ class PrivacyMiddleware(Middleware):
         url_spans = _find_url_spans(text)
         uuid_spans = _find_uuid_spans(text)
         slack_id_spans = _find_slack_id_spans(text)
+        prefix_id_spans = _find_prefix_id_spans(text)
 
         # NER-based entity types need higher confidence thresholds
         # because the spaCy model frequently tags common English words
@@ -1035,6 +1058,10 @@ class PrivacyMiddleware(Middleware):
 
             # Skip entities inside Slack IDs
             if slack_id_spans and _overlaps_any_span(r.start, r.end, slack_id_spans):
+                continue
+
+            # Skip entities inside prefix-style IDs
+            if prefix_id_spans and _overlaps_any_span(r.start, r.end, prefix_id_spans):
                 continue
 
             # Enforce higher score thresholds for NER-based entities

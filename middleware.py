@@ -314,12 +314,7 @@ class PrivacyMiddleware(Middleware):
 
     # ── Surrogate notice ───────────────────────────────────────────────────
 
-    _SURROGATE_NOTICE = (
-        "[Privacy note: Person names and other PII in this response have been "
-        "replaced with privacy surrogates. They may differ from the names the "
-        "user provided. Use the surrogate names as-is when referencing these "
-        "entities.]"
-    )
+    _SURROGATE_NOTICE = "[PII surrogated — pass back verbatim]"
 
     def _append_surrogate_notice(self, result: Any, entity_types: list[str]) -> Any:
         """Append a short privacy notice to a tool result when PII was masked."""

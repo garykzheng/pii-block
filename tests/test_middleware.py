@@ -239,7 +239,7 @@ class TestSurrogateNotice:
         result = await self.mw.on_call_tool(context, call_next)
 
         assert "John Smith" not in result
-        assert "privacy surrogates" in result
+        assert "PII surrogated" in result
 
     @pytest.mark.asyncio
     async def test_no_notice_when_no_pii(self):
@@ -287,7 +287,7 @@ class TestSurrogateNotice:
         assert len(result) == 2
         assert "456-78-9012" not in result[0]
         assert hasattr(result[-1], "text")
-        assert "privacy surrogates" in result[-1].text
+        assert "PII surrogated" in result[-1].text
 
 
 class FakeToolResult:

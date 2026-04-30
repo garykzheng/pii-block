@@ -177,12 +177,20 @@ class MappingStore:
             surr_parts = surrogate.split()
             if len(real_parts) > 1 and len(real_parts) == len(surr_parts):
                 for rp, sp in zip(real_parts, surr_parts):
-                    if rp != real_value:  # Don't re-store the full value
-                        # Only create sub-token if no mapping exists yet —
-                        # first full-name encounter wins for sub-tokens
-                        existing = self._forward.get(entity_type, {}).get(rp)
-                        if existing is None:
-                            self._store_single(entity_type, rp, sp)
+                    if rp == real_value:  # Don't re-store the full value
+                        continue
+                    # Only create sub-token if no mapping exists yet —
+                    # first full-name encounter wins for sub-tokens.
+                    if self._forward.get(entity_type, {}).get(rp) is not None:
+                        continue
+                    # Reverse-direction collision check: if this surrogate
+                    # token is already used for a different real value,
+                    # skip creating the sub-token. Otherwise demap would
+                    # ambiguously resolve back to the wrong real value.
+                    rev_existing = self._reverse.get(entity_type, {}).get(sp)
+                    if rev_existing is not None and rev_existing != rp:
+                        continue
+                    self._store_single(entity_type, rp, sp)
 
         self._write_locked()
 

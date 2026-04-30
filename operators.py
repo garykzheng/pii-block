@@ -177,14 +177,63 @@ class DeterministicFakerAnonymizer(Operator):
         # Derive a deterministic seed from HMAC(key, entity_type + ":" + text)
         if isinstance(key, str):
             key = key.encode()
-        mac = hmac.new(key, f"{entity_type}:{text}".encode(), hashlib.sha256)
-        seed = int.from_bytes(mac.digest()[:4], "big")
-
-        faker = Faker()
-        Faker.seed(seed)
 
         method_name = _FAKER_METHODS.get(entity_type, "name")
-        fake_value: str = getattr(faker, method_name)()
+
+        # Faker's name pool is finite (a few thousand entries), so when
+        # the mapping store grows large, multiple distinct real values
+        # can collide on the same surrogate. That breaks demap (one
+        # surrogate must map back to exactly one real value).
+        # Re-roll the seed up to MAX_ATTEMPTS times to avoid collisions.
+        # For multi-word PERSON values, also require each sub-token to
+        # be free, so e.g. the first-name "Terri" alone isn't ambiguous
+        # across multiple full-name surrogates.
+        # If we still collide, append a discriminator suffix to force
+        # uniqueness.
+        MAX_ATTEMPTS = 32
+        fake_value: str | None = None
+        candidate: str = ""
+
+        def _has_collision(c: str) -> bool:
+            """True if this candidate (or any sub-token) is already
+            taken by a different real value."""
+            if mapping_store is None:
+                return False
+            owner = mapping_store.has_surrogate_anywhere(c)
+            if owner is not None and owner[1] != text:
+                return True
+            # Sub-token check for multi-word PERSON values
+            if entity_type == "PERSON" and " " in text and " " in c:
+                real_parts = text.split()
+                cand_parts = c.split()
+                if len(real_parts) == len(cand_parts):
+                    for rp, cp in zip(real_parts, cand_parts):
+                        if rp == text:
+                            continue
+                        sub_owner = mapping_store.has_surrogate_anywhere(cp)
+                        if sub_owner is not None and sub_owner[1] != rp:
+                            return True
+            return False
+
+        for attempt in range(MAX_ATTEMPTS):
+            seed_input = (
+                f"{entity_type}:{text}:{attempt}".encode()
+                if attempt
+                else f"{entity_type}:{text}".encode()
+            )
+            mac = hmac.new(key, seed_input, hashlib.sha256)
+            seed = int.from_bytes(mac.digest()[:4], "big")
+            faker = Faker()
+            Faker.seed(seed)
+            candidate = getattr(faker, method_name)()
+            if not _has_collision(candidate):
+                fake_value = candidate
+                break
+        if fake_value is None:
+            # Last resort: append a hex discriminator from the HMAC tail
+            mac = hmac.new(key, f"{entity_type}:{text}:disambiguate".encode(), hashlib.sha256)
+            disc = mac.hexdigest()[:6]
+            fake_value = f"{candidate} ({disc})" if candidate else f"<{entity_type}:{disc}>"
 
         if mapping_store:
             mapping_store.store(entity_type, text, fake_value)

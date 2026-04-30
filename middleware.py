@@ -1064,6 +1064,21 @@ class PrivacyMiddleware(Middleware):
             if min_score and r.score < min_score:
                 continue
 
+            # Heuristics applied to ALL NER-based entity types
+            # (PERSON, LOCATION, ORGANIZATION) — these often misfire on
+            # technical identifiers, snake_case names, and pure-numeric
+            # values that look entity-shaped to spaCy.
+            if r.entity_type in _NER_SCORE_THRESHOLDS:
+                stripped = value.strip()
+                # Skip snake_case identifiers (created_by, workflow_name, etc.)
+                if "_" in stripped:
+                    continue
+                # Skip pure-digit values like SQL aggregates (COUNT, SUM)
+                # which are sometimes serialized as strings (e.g. BIGINT)
+                # and tagged as LOCATION (mistaken for ZIP/address).
+                if stripped.replace(".", "").replace(",", "").isdigit():
+                    continue
+
             if r.entity_type == "PERSON":
                 # Skip very short values (initials, single chars)
                 stripped = value.strip().rstrip(".")
@@ -1077,10 +1092,6 @@ class PrivacyMiddleware(Middleware):
                     continue
                 # Skip values containing @ (emails misdetected as names)
                 if "@" in value:
-                    continue
-                # Skip snake_case identifiers (created_by, job_output, etc.)
-                # Real person names virtually never contain underscores.
-                if "_" in value:
                     continue
                 # Skip values containing digits (likely identifiers/codes)
                 if any(c.isdigit() for c in value):

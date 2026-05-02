@@ -462,14 +462,26 @@ class PrivacyMiddleware(Middleware):
 
     # ── Surrogate de-mapping (outbound) ───────────────────────────────────
 
-    def _demap_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Scan tool arguments for known surrogates and replace with real values."""
+    def _demap_arguments(
+        self, arguments: dict[str, Any], path: str = ""
+    ) -> dict[str, Any]:
+        """Scan tool arguments for known surrogates and replace with real values.
+
+        Tracks the JSON path so values at paths matching never_mask_paths
+        can be skipped — the same path exclusions that protect inbound
+        masking also protect outbound demap rewriting (e.g. AWS region
+        codes, Logs Insights query strings, technical identifiers).
+        """
         new_args: dict[str, Any] = {}
         for key, value in arguments.items():
+            child_path = f"{path}.{key}" if path else key
+            if self.policy.is_path_excluded(child_path):
+                new_args[key] = value
+                continue
             if isinstance(value, str):
                 new_args[key] = self._demap_string(value)
             elif isinstance(value, dict):
-                new_args[key] = self._demap_arguments(value)
+                new_args[key] = self._demap_arguments(value, child_path)
             elif isinstance(value, list):
                 new_args[key] = [
                     self._demap_string(v) if isinstance(v, str) else v
@@ -1218,6 +1230,24 @@ class PrivacyMiddleware(Middleware):
                 # Skip values containing digits (likely identifiers/codes)
                 if any(c.isdigit() for c in value):
                     continue
+
+            if r.entity_type == "PHONE_NUMBER":
+                # Skip Unix-timestamp-shaped values. Constrained to
+                # the 2017–2049 epoch-seconds range (or its ms
+                # equivalent) so that real US phone numbers — which
+                # start with a 2-9 area code and produce integers
+                # ≥ 2_000_000_000 — are unaffected. Pure-digit values
+                # in the timestamp band are virtually always epochs.
+                bare = value.strip()
+                if bare.isdigit():
+                    try:
+                        n = int(bare)
+                        if len(bare) == 10 and 1_500_000_000 <= n <= 2_500_000_000:
+                            continue  # Unix seconds (≈ 2017–2049)
+                        if len(bare) == 13 and 1_500_000_000_000 <= n <= 2_500_000_000_000:
+                            continue  # Unix milliseconds (≈ 2017–2049)
+                    except ValueError:
+                        pass
 
             filtered.append(r)
         return filtered

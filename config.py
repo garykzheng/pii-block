@@ -58,6 +58,7 @@ class PolicyConfig:
     custom_recognizers: list[CustomRecognizer] = field(default_factory=list)
     field_rules: list[FieldRule] = field(default_factory=list)
     never_mask_paths: list[str] = field(default_factory=list)
+    sensitive_arg_patterns: list[str] = field(default_factory=list)
     allow_list: list[str] = field(default_factory=list)
     surrogate_notice: bool = True
 
@@ -118,6 +119,7 @@ def load_policy(path: str | Path) -> PolicyConfig:
 
     allow_list: list[str] = raw.get("allow_list", [])
     never_mask_paths: list[str] = raw.get("never_mask_paths", [])
+    sensitive_arg_patterns: list[str] = raw.get("sensitive_arg_patterns", [])
     surrogate_notice: bool = raw.get("surrogate_notice", True)
 
     return PolicyConfig(
@@ -125,6 +127,7 @@ def load_policy(path: str | Path) -> PolicyConfig:
         custom_recognizers=custom_recognizers,
         field_rules=field_rules,
         never_mask_paths=never_mask_paths,
+        sensitive_arg_patterns=sensitive_arg_patterns,
         allow_list=allow_list,
         surrogate_notice=surrogate_notice,
     )

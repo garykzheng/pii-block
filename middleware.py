@@ -7,6 +7,7 @@ PrivacyMiddleware sits in the proxy pipeline and:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import re
@@ -292,11 +293,30 @@ class PrivacyMiddleware(Middleware):
                 demapped_count=demapped_count,
             ))
 
+        # Detect sensitive arg patterns BEFORE demap is applied — the
+        # demapped real values are what hit the backend, but the
+        # decision about whether the response should be treated as a
+        # credential blob is based on the original (or demapped) arg
+        # values. We use the post-demap args because that's what
+        # actually identifies the resource being fetched.
+        sensitive_call = self._has_sensitive_args(
+            context.message.arguments if context.message else None
+        )
+
         # CALL the actual tool
         result = await call_next(context)
 
-        # POST-CALL: mask PII in the response
-        masked_result, entity_types, masked_count = self._mask_tool_result_with_stats(result)
+        if sensitive_call:
+            # POST-CALL: mask the entire result as one SECRET blob,
+            # bypassing field-rule and Presidio analysis. The agent
+            # gets one opaque surrogate; demap reverses it on the
+            # next outbound tool call.
+            masked_result, entity_types, masked_count = self._mask_tool_result_as_secret(
+                result
+            )
+        else:
+            # POST-CALL: mask PII in the response
+            masked_result, entity_types, masked_count = self._mask_tool_result_with_stats(result)
 
         if masked_count > 0 and self.audit_log is not None:
             self.audit_log.record(AuditEvent(
@@ -311,6 +331,108 @@ class PrivacyMiddleware(Middleware):
             masked_result = self._append_surrogate_notice(masked_result, entity_types)
 
         return masked_result
+
+    # ── Sensitive-arg blob masking ────────────────────────────────────────
+
+    def _has_sensitive_args(self, arguments: Any) -> bool:
+        """Recursively check whether any string arg matches a
+        sensitive_arg_patterns glob. Used to flag tool calls whose
+        responses should be treated as opaque credential blobs.
+        """
+        if not self.policy.sensitive_arg_patterns or arguments is None:
+            return False
+        patterns = self.policy.sensitive_arg_patterns
+
+        def walk(obj: Any) -> bool:
+            if isinstance(obj, str):
+                return any(fnmatch.fnmatch(obj, p) for p in patterns)
+            if isinstance(obj, dict):
+                return any(walk(v) for v in obj.values())
+            if isinstance(obj, list):
+                return any(walk(v) for v in obj)
+            return False
+
+        return walk(arguments)
+
+    def _mask_tool_result_as_secret(
+        self, result: Any
+    ) -> tuple[Any, list[str], int]:
+        """Mask the entire tool result content as one SECRET blob.
+
+        Used when the request matched a sensitive_arg_pattern (e.g.
+        Redis cookie payload). Each text content item gets its full
+        text replaced with one deterministic SECRET surrogate; demap
+        reverses it when the agent passes the surrogate back.
+        """
+        if result is None:
+            return result, [], 0
+        masked_count = 0
+
+        def _mask_text_blob(text: str) -> str:
+            nonlocal masked_count
+            if not text or not text.strip():
+                return text
+            existing = self.mapping_store.get_surrogate("SECRET", text)
+            if existing is not None:
+                masked_count += 1
+                return existing
+            masked = self._mask_field_value(text, "SECRET")
+            if masked != text:
+                masked_count += 1
+            return masked
+
+        # CallToolResult-style object with .content list
+        if hasattr(result, "content") and isinstance(result.content, list):
+            new_content = []
+            for item in result.content:
+                if isinstance(item, str):
+                    new_content.append(_mask_text_blob(item))
+                elif hasattr(item, "text") and isinstance(item.text, str):
+                    new_text = _mask_text_blob(item.text)
+                    if new_text != item.text:
+                        if hasattr(item, "model_copy"):
+                            item = item.model_copy(update={"text": new_text})
+                        else:
+                            try:
+                                item.text = new_text
+                            except (AttributeError, TypeError):
+                                pass
+                    new_content.append(item)
+                else:
+                    new_content.append(item)
+            try:
+                result.content[:] = new_content
+            except (TypeError, AttributeError):
+                if hasattr(result, "model_copy"):
+                    result = result.model_copy(update={"content": new_content})
+            # Wipe structured_content — its fields would otherwise leak the
+            # blob contents alongside the masked text.
+            if getattr(result, "structured_content", None) is not None:
+                try:
+                    result.structured_content = None
+                except (TypeError, AttributeError):
+                    pass
+            return result, ["SECRET"] if masked_count > 0 else [], masked_count
+
+        if isinstance(result, str):
+            return _mask_text_blob(result), ["SECRET"] if masked_count > 0 else [], masked_count
+
+        if isinstance(result, list):
+            new_list = []
+            for item in result:
+                if isinstance(item, str):
+                    new_list.append(_mask_text_blob(item))
+                elif hasattr(item, "text") and isinstance(item.text, str):
+                    new_text = _mask_text_blob(item.text)
+                    if new_text != item.text:
+                        if hasattr(item, "model_copy"):
+                            item = item.model_copy(update={"text": new_text})
+                    new_list.append(item)
+                else:
+                    new_list.append(item)
+            return new_list, ["SECRET"] if masked_count > 0 else [], masked_count
+
+        return result, [], 0
 
     # ── Surrogate notice ───────────────────────────────────────────────────
 

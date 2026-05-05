@@ -118,7 +118,20 @@ class MappingStore:
             self._load_sync()
 
     def _write_locked(self) -> None:
-        """Write encrypted mappings to disk with an exclusive file lock."""
+        """Write encrypted mappings to disk atomically.
+
+        Uses a write-to-temp + os.rename strategy so that concurrent
+        readers in other processes never see a partial / truncated /
+        being-written file. POSIX rename is atomic at the filesystem
+        level: a reader either gets the old file in full or the new
+        file in full, never an in-progress write. Without this, the
+        previous flow (open(wb) truncates → acquire lock → write) had
+        a window where a reader could open the truncated empty file,
+        fail to decrypt, silently keep its stale in-memory state, and
+        miss surrogates that another process had just stored. That
+        manifested as e.g. Playwright failing to demap a credential
+        right after the proxy that issued it stored the mapping.
+        """
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,18 +139,23 @@ class MappingStore:
         json_bytes = json.dumps({"forward": self._forward}, indent=2).encode()
         encrypted = _encrypt(json_bytes, self._enc_key)
 
+        # Write to a sibling temp file first; lock it for any concurrent
+        # writers using the same temp name (best-effort), then rename.
+        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
         fd = None
         try:
-            fd = open(self._path, "wb")
+            fd = open(tmp_path, "wb")
             fcntl.flock(fd, fcntl.LOCK_EX)
             fd.write(encrypted)
             fd.flush()
+            os.fsync(fd.fileno())
         finally:
             if fd is not None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 fd.close()
 
-        os.chmod(self._path, 0o600)
+        os.chmod(tmp_path, 0o600)
+        os.rename(tmp_path, self._path)
         self._last_mtime = self._path.stat().st_mtime
 
     # ── Public API ────────────────────────────────────────────────────────

@@ -757,6 +757,13 @@ class PrivacyMiddleware(Middleware):
                             if not self._looks_like_person_name(value):
                                 new_obj[key] = walk(value, field_path)
                                 continue
+                        # If a SECRET field rule fires on something that
+                        # is structurally an email, mask as EMAIL_ADDRESS
+                        # instead so the surrogate is email-shaped (not a
+                        # password). This matters for 1Password USERNAME
+                        # fields whose value is the user's email address.
+                        if entity == "SECRET" and self._looks_like_email(value):
+                            entity = "EMAIL_ADDRESS"
                         masked = self._mask_field_value(value, entity)
                         if masked != value:
                             count += 1
@@ -796,6 +803,14 @@ class PrivacyMiddleware(Middleware):
     # Characters allowed in person names (letters, spaces, hyphens,
     # apostrophes, periods for initials, and accented unicode).
     _NAME_CHAR_RE = re.compile(r"^[\w\s'\-.]+$", re.UNICODE)
+
+    # Loose email shape (RFC 5321 simplified): one @, at least one dot
+    # in the host part, no whitespace.
+    _EMAIL_SHAPE_RE = re.compile(r"^\S+@\S+\.\S+$")
+
+    def _looks_like_email(self, value: str) -> bool:
+        """Return True if value structurally looks like an email."""
+        return bool(self._EMAIL_SHAPE_RE.match(value.strip()))
 
     def _looks_like_person_name(self, value: str) -> bool:
         """Check whether a string plausibly looks like a person name.
@@ -901,9 +916,14 @@ class PrivacyMiddleware(Middleware):
         # excluding very short values (< 4 chars) to avoid false matches
         # on common words embedded in longer text.
         # Also skip any values on the policy allow list, and any values
-        # that *contain* an allow-listed term (catches cascading garbage
-        # like "Rebecca Paycom" when "Paycom" is allow-listed).
+        # whose tokens (split on common separators) match an allow-listed
+        # term — catches cascading garbage like "Rebecca Paycom" when
+        # "Paycom" is allow-listed, without spuriously skipping values
+        # that just happen to contain an allow-listed word as a substring
+        # (e.g. "gary@tryfinch.com" contains "finch" but the local part
+        # "tryfinch" is a different token).
         allow_set = {v.lower() for v in self.policy.allow_list}
+        sep_re = re.compile(r"[\s_\-./@]+")
         pairs: list[tuple[str, str]] = []
         for _etype, mappings in forward.items():
             for real_val, surrogate in mappings.items():
@@ -912,7 +932,8 @@ class PrivacyMiddleware(Middleware):
                 rv_lower = real_val.lower()
                 if rv_lower in allow_set:
                     continue
-                if any(term in rv_lower for term in allow_set if len(term) >= 4):
+                tokens = sep_re.split(rv_lower)
+                if any(tok in allow_set for tok in tokens if len(tok) >= 3):
                     continue
                 pairs.append((real_val, surrogate))
 

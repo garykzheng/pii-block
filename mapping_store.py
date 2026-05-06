@@ -218,6 +218,24 @@ class MappingStore:
         self._reverse.setdefault(entity_type, {})[surrogate] = real_value
         self._reverse_ci.setdefault(entity_type, {})[surrogate.lower()] = (surrogate, real_value)
 
+    def get_surrogate_anywhere(self, real_value: str) -> tuple[str, str] | None:
+        """Cross-entity-type forward lookup. Returns (entity_type,
+        surrogate) for the first entity type that has this real value
+        mapped, or None. Used to keep surrogates stable when the same
+        real value is re-encountered under a different detected entity
+        type across responses.
+        """
+        self._maybe_refresh()
+        for entity_type, fwd in self._forward.items():
+            if real_value in fwd:
+                return entity_type, fwd[real_value]
+        real_lower = real_value.lower()
+        for entity_type, fwd in self._forward.items():
+            for rv, surr in fwd.items():
+                if rv.lower() == real_lower:
+                    return entity_type, surr
+        return None
+
     def has_surrogate_anywhere(self, surrogate: str) -> tuple[str, str] | None:
         """Search all entity types for a surrogate (case-insensitive).
 

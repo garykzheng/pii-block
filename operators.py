@@ -168,11 +168,20 @@ class DeterministicFakerAnonymizer(Operator):
         entity_type: str = params.get("entity_type", "PERSON")
         mapping_store: MappingStore | None = params.get("mapping_store")
 
-        # Check existing mapping first
+        # Check existing mapping first. Prefer same-entity lookup,
+        # but fall back to a cross-entity lookup so the agent sees a
+        # stable surrogate for the same real value regardless of which
+        # entity type fires on a particular response. Without this,
+        # e.g. an email originally stored as SECRET (via *.fields.value)
+        # would get a *different* surrogate the next time it's detected
+        # as EMAIL_ADDRESS by Presidio in a tool response.
         if mapping_store:
             existing = mapping_store.get_surrogate(entity_type, text)
             if existing is not None:
                 return existing
+            cross = mapping_store.get_surrogate_anywhere(text)
+            if cross is not None:
+                return cross[1]
 
         # Derive a deterministic seed from HMAC(key, entity_type + ":" + text)
         if isinstance(key, str):

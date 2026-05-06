@@ -804,9 +804,13 @@ class PrivacyMiddleware(Middleware):
     # apostrophes, periods for initials, and accented unicode).
     _NAME_CHAR_RE = re.compile(r"^[\w\s'\-.]+$", re.UNICODE)
 
-    # Loose email shape (RFC 5321 simplified): one @, at least one dot
-    # in the host part, no whitespace.
-    _EMAIL_SHAPE_RE = re.compile(r"^\S+@\S+\.\S+$")
+    # Tight email shape: local-part allowed chars + @ + dotted host
+    # ending in a real-looking TLD (2–24 ASCII letters). This rejects
+    # passwords that happen to contain @ and . but aren't real emails
+    # (e.g. "p@ss.w0rd!").
+    _EMAIL_SHAPE_RE = re.compile(
+        r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}$"
+    )
 
     def _looks_like_email(self, value: str) -> bool:
         """Return True if value structurally looks like an email."""
